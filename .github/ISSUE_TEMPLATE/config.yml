@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security report
+    url: https://github.com/kforth/python-cgm/security/advisories/new
+    about: Please report security vulnerabilities privately.
+  - name: Project documentation
+    url: https://github.com/kforth/python-cgm/blob/main/README.md
+    about: Check README for usage, CLI flags, and API details.

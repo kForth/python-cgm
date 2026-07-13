@@ -1,0 +1,121 @@
+[build-system]
+requires = ["setuptools >= 77.0", "setuptools_scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "python-cgm"
+dynamic = ["readme", "version"]
+description = "Read-only Python tools for parsing binary CGM (ISO/IEC 8632) files and exporting image-related data as raw payloads, SVG, and JSON."
+keywords = [
+    "cgm",
+]
+authors = [{ name = "Kestin Goforth" }]
+dependencies = [
+    "click>=8.1,<9",
+]
+requires-python = ">=3.10"
+license = "BSD-3-Clause"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: File Formats",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+homepage = "https://github.com/kforth/python-cgm"
+repository = "https://github.com/kforth/python-cgm"
+
+[project.scripts]
+cgm-extract = "cgm.cli:main"
+
+[dependency-groups]
+dev = [
+    "black==26.5.*",
+    "codespell==2.4.*",
+    "isort==8.0.*",
+    "mypy==2.3.*",
+    "pylint==4.0.*",
+    "ruff==0.15.*",
+]
+test = [
+    "pytest==8.4.*",
+]
+
+[tool.setuptools.dynamic]
+readme = { file = "README.md" }
+
+[tool.setuptools.package-data]
+"*" = ["README.md", "LICENSE"]
+
+[tool.setuptools.packages.find]
+include = ["cgm*"]
+
+[tool.setuptools_scm]
+# can be empty if no extra settings are needed, presence enables setuptools_scm
+
+[tool.mypy]
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+no_implicit_optional = true
+disallow_incomplete_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+extend-select = [
+    "A",  # flake8-builtins
+    "B",  # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "F",  # pyflakes
+    "E",  # pycodestyle errors
+    "I",  # isort
+    "N",  # pep8-naming
+    "PGH",  # pygrep-hooks
+    "PL",  # pylint
+    "RUF",  # ruff-specific rules
+    "T20",  # flake8-print
+    "TCH",  # flake8-type-checking
+    "UP",  # pyupgrade
+    "W",  # pycodestyle warnings
+    "YTT",  # flake8-2020
+]
+ignore = [
+    "B026",  # star-arg-unpacking-after-keyword-arg
+    "PLR",  # pylint refactor
+]
+
+[tool.black]
+line-length = 100
+include = '(python-cgm | .github).*\.pyi?$'
+
+[tool.isort]
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+ensure_newline_before_comments = true
+line_length = 90
+known_first_part = 'cgm'
+
+[tool.codespell]
+skip = '.git,setup.cfg'
+ignore-words = '.codespell_ignore_words'
+quiet-level = 3
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
