@@ -109,3 +109,6 @@ ENV/
 
 # TODO File
 TODO
+
+# Debug
+out/
