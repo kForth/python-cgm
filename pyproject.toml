@@ -12,6 +12,7 @@ keywords = [
 authors = [{ name = "Kestin Goforth" }]
 dependencies = [
     "click>=8.1,<9",
+    "imagecodecs>=2024.1",
     "pillow>=10,<12",
 ]
 requires-python = ">=3.10"
