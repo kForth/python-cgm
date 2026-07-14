@@ -45,7 +45,7 @@ class RawImage:
 
 @dataclass(slots=True, frozen=True)
 class HotSpot:
-    """Represents a best-effort hotspot region found in CGM application data."""
+    """Represents a hotspot region recovered from APD metadata or APS geometry."""
 
     index: int
     source_tag: str | None

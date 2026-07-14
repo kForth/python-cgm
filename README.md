@@ -11,13 +11,13 @@
 
 
 Read-only Python tools for parsing binary and clear-text CGM (ISO/IEC 8632) files,
-producing a single final SVG image output (with optional embedded raster background),
+producing a single final SVG image output that can include an embedded raster background,
 and extracting hotspot metadata as JSON.
 
 This package focuses on practical CGM extraction workflows: parsing CGM content,
 extracting image-bearing `Cell Array` payloads, composing raster+vector SVG output,
 and recovering hotspots from both APD region properties and APS geometry fallback.
-It does not support writing CGM files.
+It requires Pillow and imagecodecs for raster decoding and does not support writing CGM files.
 
 ## Installation
 
