@@ -1,4 +1,4 @@
-"""Command-line interface for python-cgm."""
+"""Command-line interface for final SVG and hotspot export."""
 
 from __future__ import annotations
 
@@ -12,9 +12,8 @@ from pathlib import Path
 import click
 
 from .extract import (
-    extract_data_json_to_directory,
-    extract_raw_images_to_directory,
-    extract_vector_svg_to_directory,
+    extract_hotspots_to_directory,
+    extract_rendered_images_to_directory,
 )
 
 
@@ -22,31 +21,16 @@ from .extract import (
 @click.argument("srcfile", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.argument("output_dir", type=click.Path(file_okay=False, path_type=Path))
 @click.option(
-    "--stem",
-    default="image",
-    show_default=True,
-    help="Filename stem for extracted payload files.",
-)
-@click.option(
     "--debug",
     is_flag=True,
-    help="Enable debug logging for CGM parsing and extraction.",
-)
-@click.option(
-    "--svg",
-    is_flag=True,
-    help="Convert vector CGM drawing commands into a best-effort SVG.",
-)
-@click.option(
-    "--json",
-    "emit_json",
-    is_flag=True,
-    help="Export parsed/stored CGM data and metadata as JSON.",
+    help="Enable debug logging and write decode diagnostics report.",
 )
 def cli(
-    srcfile: Path, output_dir: Path, stem: str, debug: bool, svg: bool, emit_json: bool
+    srcfile: Path,
+    output_dir: Path,
+    debug: bool,
 ) -> None:
-    """Extract raw payloads and/or export SVG/JSON from SRCFILE into OUTPUT_DIR."""
+    """Export final SVG and hotspot JSON using the source filename as output stem."""
     if debug:
         logging.basicConfig(
             level=logging.DEBUG,
@@ -54,19 +38,22 @@ def cli(
         )
 
     written_paths: list[Path] = []
+    stem = srcfile.stem or "image"
 
-    if svg:
-        svg_path = extract_vector_svg_to_directory(srcfile, output_dir, stem=stem)
-        written_paths.append(svg_path)
+    try:
+        written_paths.extend(
+            extract_rendered_images_to_directory(
+                srcfile,
+                output_dir,
+                stem=stem,
+                debug_report=debug,
+            )
+        )
+        hotspot_path = extract_hotspots_to_directory(srcfile, output_dir, stem=stem)
+        written_paths.append(hotspot_path)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
 
-    if emit_json:
-        json_path = extract_data_json_to_directory(srcfile, output_dir, stem=stem)
-        written_paths.append(json_path)
-
-    if not svg and not emit_json:
-        written_paths.extend(extract_raw_images_to_directory(srcfile, output_dir, stem=stem))
-
-    click.echo(f"Extracted {len(written_paths)} image payload(s).")
     for path in written_paths:
         click.echo(str(path))
 

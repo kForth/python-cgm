@@ -10,12 +10,14 @@
 ![PyPI Downloads](https://img.shields.io/pypi/dm/python-cgm)
 
 
-Read-only Python tools for parsing binary CGM (ISO/IEC 8632) files and exporting
-image-related data as raw payloads, SVG, and JSON.
+Read-only Python tools for parsing binary and clear-text CGM (ISO/IEC 8632) files,
+producing a single final SVG image output (with optional embedded raster background),
+and extracting hotspot metadata as JSON.
 
-This package focuses on **binary CGM parsing** and extraction of image-bearing
-`Cell Array` elements, plus best-effort vector conversion for vector-oriented
-CGM content. It does not support writing CGM files.
+This package focuses on practical CGM extraction workflows: parsing CGM content,
+extracting image-bearing `Cell Array` payloads, composing raster+vector SVG output,
+and recovering hotspots from both APD region properties and APS geometry fallback.
+It does not support writing CGM files.
 
 ## Installation
 
@@ -27,10 +29,13 @@ pip install python-cgm
 
 ## What It Does
 
-- Parses binary CGM command streams.
+- Parses binary and clear-text CGM command streams.
 - Finds `Cell Array` elements (class 4, element 9).
 - Extracts raw payload bytes from each image-bearing element.
-- Converts vector-like CGM drawing primitives into a best-effort SVG.
+- Builds a final SVG output that can include an embedded raster background.
+- Stitches/decodes clear-text tiled bitonal arrays for SVG background composition.
+- Converts vector-like CGM drawing primitives into a best-effort SVG overlay.
+- Extracts hotspots from APD `name`/`region` and APS geometry groups (for files such as GR-77775).
 - Exports parsed element data, payload metadata, and embedded SVG as JSON.
 
 ## Quick Start
@@ -38,6 +43,8 @@ pip install python-cgm
 ```python
 from cgm import (
     extract_data_json,
+    extract_final_image_and_hotspots,
+    extract_hotspots,
     extract_raw_images,
     extract_raw_images_to_directory,
     extract_vector_svg,
@@ -63,38 +70,35 @@ print("SVG length:", len(svg))
 
 snapshot_json = extract_data_json("drawing.cgm")
 print("JSON length:", len(snapshot_json))
+
+final = extract_final_image_and_hotspots("drawing.cgm")
+print("Final SVG length:", len(final["image"]))
+print("Hotspots:", len(final["hotspots"]))
+
+hotspots = extract_hotspots("drawing.cgm")
+print("Hotspot objects:", len(hotspots))
 ```
 
 ## CLI
 
-After installation, use the CLI to extract payloads directly:
+After installation, use the CLI to export the final SVG and hotspot JSON:
 
 ```bash
 cgm-extract file.cgm ./out
 ```
 
-Export vector SVG:
+By default this writes:
+
+- `<basename>_0000.svg`
+- `<basename>_0000.hotspots.json`
+
+With debug enabled it also writes:
+
+- `<basename>_decode_report.json`
+
+Optional flag:
 
 ```bash
-cgm-extract file.cgm ./out --svg
-```
-
-Export parsed data snapshot as JSON:
-
-```bash
-cgm-extract file.cgm ./out --json
-```
-
-Export both SVG and JSON in one run:
-
-```bash
-cgm-extract file.cgm ./out --svg --json
-```
-
-Optional flags:
-
-```bash
-cgm-extract file.cgm ./out --stem payload
 cgm-extract file.cgm ./out --debug
 ```
 
@@ -109,6 +113,11 @@ cgm-extract file.cgm ./out --debug
 - `extract_data_json(file_path) -> str`
 - `extract_data_json_from_bytes(data) -> str`
 - `extract_data_json_to_directory(file_path, output_dir, stem="image") -> Path`
+- `extract_hotspots(file_path) -> list[HotSpot]`
+- `extract_hotspots_from_bytes(data) -> list[HotSpot]`
+- `extract_hotspots_to_directory(file_path, output_dir, stem="image") -> Path`
+- `extract_final_image_and_hotspots(file_path) -> dict[str, object]`
+- `extract_rendered_images_to_directory(file_path, output_dir, stem="image", debug_report=False) -> list[Path]`
 
 `RawImage` fields:
 
@@ -119,9 +128,10 @@ cgm-extract file.cgm ./out --debug
 
 ## Scope And Limitations
 
-- Supports **binary CGM** streams.
-- Provides **raw payload extraction** for raster data, not full pixel decoding to PNG/JPEG.
+- Supports binary and clear-text CGM streams used by this project.
+- Raster decoding/composition is best effort and depends on payload encoding patterns.
 - SVG output is **best effort** and depends on CGM command patterns in the file.
+- Hotspot extraction is best effort and supports APD region records plus APS geometry fallback.
 - JSON output can be large because it includes full element parameter/payload hex data.
 - Does **not** support CGM writing.
 
@@ -129,4 +139,4 @@ cgm-extract file.cgm ./out --debug
 
 python-cgm (C) 2026 Kestin Goforth.
 
-This project is licensed under the BSD 3-Clause License - see the [license file](LICENSES/BSD-3-Clause.txt) for details.
+This project is licensed under the BSD 3-Clause License - see the [license file](LICENSE) for details.

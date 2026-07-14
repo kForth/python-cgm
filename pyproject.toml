@@ -5,13 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "python-cgm"
 dynamic = ["readme", "version"]
-description = "Read-only Python tools for parsing binary CGM (ISO/IEC 8632) files and exporting image-related data as raw payloads, SVG, and JSON."
+description = "Read-only Python tools for parsing binary and clear-text CGM files, composing final SVG output, and extracting hotspots."
 keywords = [
     "cgm",
 ]
 authors = [{ name = "Kestin Goforth" }]
 dependencies = [
     "click>=8.1,<9",
+    "pillow>=10,<12",
 ]
 requires-python = ">=3.10"
 license = "BSD-3-Clause"

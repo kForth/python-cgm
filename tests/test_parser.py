@@ -47,3 +47,32 @@ def test_iter_elements_raises_on_truncated_parameter_block() -> None:
 
     with pytest.raises(CGMParseError):
         list(iter_elements(data))
+
+
+def test_iter_elements_parses_clear_text_line() -> None:
+    data = b'LINE 0 0 10 10;\nTEXT 5 6 "HELLO";\n'
+
+    elements = list(iter_elements(data))
+
+    assert len(elements) == 2
+    assert elements[0].class_id == 4
+    assert elements[0].element_id == 1
+    assert len(elements[0].parameters) == 16
+    assert elements[1].class_id == 4
+    assert elements[1].element_id == 5
+
+
+def test_iter_elements_parses_clear_text_bitonal_tile_as_cell_array() -> None:
+    hex_payload = "0123456789ABCDEFFEDCBA9876543210"
+    data = (
+        "BEGTILEARRAY 0 0 0 0 1 1 2 2 0 0 0 0 2 2; "
+        f"BITONALTILE 2 16 0 1 '' {hex_payload}; "
+        "ENDTILEARRAY;"
+    ).encode("ascii")
+
+    elements = list(iter_elements(data))
+
+    assert len(elements) == 1
+    assert elements[0].class_id == 4
+    assert elements[0].element_id == 9
+    assert elements[0].parameters[20:] == bytes.fromhex(hex_payload)

@@ -41,3 +41,17 @@ class RawImage:
         target = out_dir / self.default_filename(stem=stem)
         target.write_bytes(self.payload)
         return target
+
+
+@dataclass(slots=True, frozen=True)
+class HotSpot:
+    """Represents a best-effort hotspot region found in CGM application data."""
+
+    index: int
+    source_tag: str | None
+    name: str | None
+    x_min: int
+    y_min: int
+    x_max: int
+    y_max: int
+    raw_region_hex: str
