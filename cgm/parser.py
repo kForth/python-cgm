@@ -218,6 +218,10 @@ def _pack_f32_points(numbers: list[float]) -> bytes:
     return b"".join(struct.pack(">f", value) for value in values)
 
 
+def _pack_f32_values(numbers: list[float]) -> bytes:
+    return b"".join(struct.pack(">f", value) for value in numbers)
+
+
 def _pack_u16(value: int) -> bytes:
     return max(0, min(65535, value)).to_bytes(2, "big", signed=False)
 
@@ -286,8 +290,17 @@ def _map_text_command(statement: str) -> tuple[int, int, bytes] | None:
     if command in {"LINE", "POLYLINE"}:
         return 4, 1, _pack_f32_points(numbers)
 
+    if command in {"DISJOINTPOLYLINE", "DISJTLINE", "DJPOLYLINE"}:
+        return 4, 2, _pack_f32_points(numbers)
+
+    if command in {"POLYMARKER", "MARKER"}:
+        return 4, 3, _pack_f32_points(numbers)
+
     if command == "POLYGON":
         return 4, 7, _pack_f32_points(numbers)
+
+    if command == "POLYGONSET":
+        return 4, 8, _pack_f32_points(numbers)
 
     if command in {"VDCEXT", "VDCEXTENT"} and len(numbers) >= 4:
         x1, y1, x2, y2 = (round(numbers[idx]) for idx in range(4))
@@ -300,6 +313,10 @@ def _map_text_command(statement: str) -> tuple[int, int, bytes] | None:
         text_bytes = strings[-1].encode("ascii", errors="ignore")[:255]
         return 4, 5, x + y + bytes([len(text_bytes)]) + text_bytes
 
+    if command == "APPENDTEXT" and strings:
+        text_bytes = strings[-1].encode("ascii", errors="ignore")[:255]
+        return 4, 6, bytes([len(text_bytes)]) + text_bytes
+
     if command in {"RESTRICTEDTEXT", "RESTRTEXT"} and len(numbers) >= 4 and strings:
         box_w = _pack_u16(round(numbers[0]))
         box_h = _pack_u16(round(numbers[1]))
@@ -307,6 +324,38 @@ def _map_text_command(statement: str) -> tuple[int, int, bytes] | None:
         anchor_y = _pack_u16(round(numbers[3]))
         text_bytes = strings[-1].encode("ascii", errors="ignore")[:255]
         return 4, 29, box_w + box_h + anchor_x + anchor_y + bytes([len(text_bytes)]) + text_bytes
+
+    if command in {"RECT", "RECTANGLE"} and len(numbers) >= 4:
+        return 4, 11, _pack_f32_values(numbers[:4])
+
+    if command == "CIRCLE" and len(numbers) >= 3:
+        return 4, 12, _pack_f32_values(numbers[:3])
+
+    if command in {"ARC3PT", "CIRCULARARC3POINT", "CIRCULARARC3PT"} and len(numbers) >= 6:
+        return 4, 13, _pack_f32_values(numbers[:6])
+
+    if command in {"ARC3PTCLOSE", "CIRCULARARC3POINTCLOSE", "CIRCULARARC3PTCLOSE"}:
+        if len(numbers) >= 6:
+            return 4, 14, _pack_f32_values(numbers[:6])
+
+    if command in {"ARCCENTRE", "ARCCTR", "CIRCULARARCCENTRE"} and len(numbers) >= 6:
+        return 4, 15, _pack_f32_values(numbers[:6])
+
+    if command in {"ARCCENTRECLOSE", "ARCCTRCLOSE", "CIRCULARARCCENTRECLOSE"}:
+        if len(numbers) >= 6:
+            return 4, 16, _pack_f32_values(numbers[:6])
+
+    if command == "ELLIPSE" and len(numbers) >= 6:
+        return 4, 17, _pack_f32_values(numbers[:6])
+
+    if command in {"ELLIPTICALARC", "ELLIPARC"} and len(numbers) >= 10:
+        return 4, 18, _pack_f32_values(numbers[:10])
+
+    if command in {"ELLIPTICALARCCLOSE", "ELLIPARCCLOSE"} and len(numbers) >= 10:
+        return 4, 19, _pack_f32_values(numbers[:10])
+
+    if command in {"GDP", "GENERALISEDDRAWINGPRIMITIVE"}:
+        return 4, 10, _pack_f32_values(numbers)
 
     if command == "CELLARRAY" and len(numbers) >= 9:
         x1, y1, x2, y2, x3, y3 = (round(numbers[idx]) for idx in range(6))
@@ -367,20 +416,29 @@ def _map_text_command(statement: str) -> tuple[int, int, bytes] | None:
 def _iter_text_elements(data: bytes) -> Iterator[CGMElement]:
     """Yield parsed elements from clear-text CGM command streams."""
     text = data.decode("latin-1")
+    # Some clear-text writers emit an accidental quote right before a command
+    # token (for example: ; "APD ...). Remove that marker so splitting by
+    # semicolon does not get stuck in an unmatched quoted region.
+    text = re.sub(r"(^|;)\s*[\"'](?=[A-Za-z])", r"\1 ", text)
     tile_dims: tuple[int | None, int | None] = (None, None)
 
     if log.isEnabledFor(logging.DEBUG):
         log.debug("Begin clear-text element iteration: stream_size=%d", len(data))
 
     for command_offset, statement in _split_text_commands(text):
-        words = statement.split()
+        normalized_statement = statement.lstrip()
+        # Some clear-text streams contain a stray leading quote before a command.
+        while normalized_statement.startswith(('"', "'")):
+            normalized_statement = normalized_statement[1:].lstrip()
+
+        words = normalized_statement.split()
         if not words:
             continue
 
         command = words[0].upper()
 
         if command == "BEGTILEARRAY":
-            tile_dims = _derive_tile_dimensions(_extract_numbers(statement))
+            tile_dims = _derive_tile_dimensions(_extract_numbers(normalized_statement))
             continue
 
         if command == "ENDTILEARRAY":
@@ -388,7 +446,7 @@ def _iter_text_elements(data: bytes) -> Iterator[CGMElement]:
             continue
 
         if command == "BITONALTILE":
-            payload = _extract_hex_payload(statement)
+            payload = _extract_hex_payload(normalized_statement)
             if not payload:
                 continue
             width, height = tile_dims
@@ -401,7 +459,7 @@ def _iter_text_elements(data: bytes) -> Iterator[CGMElement]:
             )
             continue
 
-        mapped = _map_text_command(statement)
+        mapped = _map_text_command(normalized_statement)
         if mapped is None:
             continue
         class_id, element_id, parameters = mapped

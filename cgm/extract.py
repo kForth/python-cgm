@@ -155,6 +155,7 @@ class _SvgStyle:
     stroke_color: str = "#000000"
     stroke_width: float = 1.0
     font_size: float = 10.0
+    marker_size: float = 2.0
 
 
 def _parse_f32_be(value: bytes) -> float | None:
@@ -370,10 +371,10 @@ def extract_hotspots_from_bytes(data: bytes) -> list[HotSpot]:
                 for x, y in _decode_point_pairs_exact(element.parameters):
                     _update_geom_bbox(context, x, y)
             elif element.element_id == 5 and len(element.parameters) >= 8:
-                x = _parse_f32_be(element.parameters[0:4])
-                y = _parse_f32_be(element.parameters[4:8])
-                if x is not None and y is not None:
-                    _update_geom_bbox(context, x, y)
+                x_val = _parse_f32_be(element.parameters[0:4])
+                y_val = _parse_f32_be(element.parameters[4:8])
+                if x_val is not None and y_val is not None:
+                    _update_geom_bbox(context, x_val, y_val)
             elif element.element_id == 29:
                 restricted = _decode_restricted_text(element.parameters)
                 if restricted is not None:
@@ -479,6 +480,225 @@ def _palette_index_to_hex(color_index: int) -> str:
 def _format_points(points: list[tuple[float, float]], *, min_y: float, max_y: float) -> str:
     mapped = (f"{x:.3f},{(max_y - (y - min_y)):.3f}" for x, y in points)
     return " ".join(mapped)
+
+
+def _map_svg_y(y: float, *, min_y: float, max_y: float) -> float:
+    return max_y - (y - min_y)
+
+
+def _decode_i16_be(value: bytes) -> int | None:
+    if len(value) != 2:
+        return None
+    return int.from_bytes(value, "big", signed=True)
+
+
+def _decode_point_pairs_i16(parameters: bytes) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for offset in range(0, len(parameters) - 3, 4):
+        x = _decode_i16_be(parameters[offset : offset + 2])
+        y = _decode_i16_be(parameters[offset + 2 : offset + 4])
+        if x is None or y is None:
+            continue
+        points.append((float(x), float(y)))
+    return points
+
+
+def _point_penalty(
+    points: list[tuple[float, float]],
+    *,
+    vdc_extent: tuple[float, float, float, float] | None,
+) -> float:
+    if not points:
+        return 1e9
+
+    if vdc_extent is None:
+        penalty = 0.0
+        for x, y in points:
+            if abs(x) > 200_000 or abs(y) > 200_000:
+                penalty += 25.0
+            if abs(x) > 1_000_000 or abs(y) > 1_000_000:
+                penalty += 250.0
+        return penalty
+
+    min_x, min_y, max_x, max_y = vdc_extent
+    span = max(1.0, max_x - min_x, max_y - min_y)
+    margin = span * 0.25
+    low_x = min_x - margin
+    high_x = max_x + margin
+    low_y = min_y - margin
+    high_y = max_y + margin
+
+    penalty = 0.0
+    for x, y in points:
+        if x < low_x or x > high_x or y < low_y or y > high_y:
+            penalty += 5.0
+        if x < (min_x - span * 10.0) or x > (max_x + span * 10.0):
+            penalty += 50.0
+        if y < (min_y - span * 10.0) or y > (max_y + span * 10.0):
+            penalty += 50.0
+
+    return penalty
+
+
+def _decode_point_pairs_best(
+    parameters: bytes,
+    *,
+    vdc_extent: tuple[float, float, float, float] | None,
+) -> list[tuple[float, float]]:
+    float_points = _decode_point_pairs_exact(parameters)
+    i16_points = _decode_point_pairs_i16(parameters)
+
+    if float_points and (len(parameters) % 8 == 0) and len(float_points) >= 2:
+        float_penalty = _point_penalty(float_points, vdc_extent=vdc_extent)
+        if not i16_points:
+            return float_points
+        i16_penalty = _point_penalty(i16_points, vdc_extent=vdc_extent)
+        # Prefer float-aligned payloads unless integer interpretation is clearly better.
+        if i16_penalty + 1.0 >= float_penalty:
+            return float_points
+
+    candidates = [candidate for candidate in (float_points, i16_points) if candidate]
+    if not candidates:
+        return []
+
+    return min(candidates, key=lambda pts: (_point_penalty(pts, vdc_extent=vdc_extent), -len(pts)))
+
+
+def _decode_vdc_extent(parameters: bytes) -> tuple[float, float, float, float] | None:
+    if len(parameters) >= 16:
+        real_values: list[float] = []
+        for idx in range(0, 16, 4):
+            value = _parse_f32_be(parameters[idx : idx + 4])
+            if value is None:
+                real_values = []
+                break
+            real_values.append(value)
+        if len(real_values) == 4:
+            x1, y1, x2, y2 = real_values
+            if x1 != x2 and y1 != y2:
+                return min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)
+
+    if len(parameters) >= 8:
+        signed_values = [
+            int.from_bytes(parameters[idx : idx + 2], "big", signed=True) for idx in (0, 2, 4, 6)
+        ]
+        x1, y1, x2, y2 = signed_values
+        if x1 != x2 and y1 != y2:
+            return float(min(x1, x2)), float(min(y1, y2)), float(max(x1, x2)), float(max(y1, y2))
+
+        unsigned_values = [
+            int.from_bytes(parameters[idx : idx + 2], "big", signed=False) for idx in (0, 2, 4, 6)
+        ]
+        x1, y1, x2, y2 = unsigned_values
+        if x1 != x2 and y1 != y2:
+            return float(min(x1, x2)), float(min(y1, y2)), float(max(x1, x2)), float(max(y1, y2))
+
+    return None
+
+
+def _decode_xy(parameters: bytes) -> tuple[float, float] | None:
+    if len(parameters) >= 8:
+        x = _parse_f32_be(parameters[0:4])
+        y = _parse_f32_be(parameters[4:8])
+        if x is not None and y is not None:
+            return x, y
+    if len(parameters) >= 4:
+        x_i16 = _decode_i16_be(parameters[0:2])
+        y_i16 = _decode_i16_be(parameters[2:4])
+        if x_i16 is not None and y_i16 is not None:
+            return float(x_i16), float(y_i16)
+    return None
+
+
+def _decode_pairwise_segments(
+    parameters: bytes,
+    *,
+    vdc_extent: tuple[float, float, float, float] | None,
+) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    points = _decode_point_pairs_best(parameters, vdc_extent=vdc_extent)
+    segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    for idx in range(0, len(points) - 1, 2):
+        segments.append((points[idx], points[idx + 1]))
+    return segments
+
+
+def _decode_gdp_polyline_points(
+    parameters: bytes,
+    *,
+    vdc_extent: tuple[float, float, float, float] | None,
+) -> list[tuple[float, float]]:
+    """Best-effort decode for GDP payloads that carry point-like coordinates."""
+    best_points: list[tuple[float, float]] = []
+    best_rank: tuple[float, int] | None = None
+
+    for offset in (0, 2, 4, 6, 8):
+        if offset >= len(parameters):
+            break
+        payload = parameters[offset:]
+
+        for decoder_bias, decoded in (
+            (0.0, _decode_point_pairs_best(payload, vdc_extent=vdc_extent)),
+            (0.25, _decode_point_pairs_heuristic(payload)),
+        ):
+            if len(decoded) < 2:
+                continue
+
+            penalty = _point_penalty(decoded, vdc_extent=vdc_extent)
+            rank = (penalty + decoder_bias + (offset * 0.1), -len(decoded))
+            if best_rank is None or rank < best_rank:
+                best_rank = rank
+                best_points = decoded
+
+    return best_points
+
+
+def _decode_rectangle_corners(
+    parameters: bytes,
+    *,
+    vdc_extent: tuple[float, float, float, float] | None,
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    points = _decode_point_pairs_best(parameters, vdc_extent=vdc_extent)
+    if len(points) >= 2:
+        return points[0], points[1]
+    return None
+
+
+def _decode_circle_data(parameters: bytes) -> tuple[float, float, float] | None:
+    if len(parameters) >= 12:
+        cx = _parse_f32_be(parameters[0:4])
+        cy = _parse_f32_be(parameters[4:8])
+        radius = _parse_f32_be(parameters[8:12])
+        if cx is not None and cy is not None and radius is not None and radius > 0:
+            return cx, cy, abs(radius)
+
+    if len(parameters) >= 6:
+        cx = _decode_i16_be(parameters[0:2])
+        cy = _decode_i16_be(parameters[2:4])
+        radius = _decode_i16_be(parameters[4:6])
+        if cx is not None and cy is not None and radius is not None and radius > 0:
+            return float(cx), float(cy), float(radius)
+
+    return None
+
+
+def _decode_ellipse_data(
+    parameters: bytes,
+    *,
+    vdc_extent: tuple[float, float, float, float] | None,
+) -> tuple[float, float, float, float] | None:
+    points = _decode_point_pairs_best(parameters, vdc_extent=vdc_extent)
+    if len(points) < 3:
+        return None
+
+    center = points[0]
+    major = points[1]
+    minor = points[2]
+    rx = ((major[0] - center[0]) ** 2 + (major[1] - center[1]) ** 2) ** 0.5
+    ry = ((minor[0] - center[0]) ** 2 + (minor[1] - center[1]) ** 2) ** 0.5
+    if rx <= 0 or ry <= 0:
+        return None
+
+    return center[0], center[1], rx, ry
 
 
 def _decode_restricted_text(parameters: bytes) -> tuple[float, float, float, float, str] | None:
@@ -696,6 +916,52 @@ def _score_bitmap(bits: list[int], width: int, height: int) -> float:
     return score
 
 
+def _is_low_confidence_element29_bitmap(bits: list[int], width: int, height: int) -> bool:
+    """Detect common low-confidence decode artifacts (top-band garbage).
+
+    This check is polarity-agnostic by evaluating the minority pixel class. It
+    rejects outputs where sparse detail is concentrated in only the top portion
+    of the frame, which commonly indicates a wrong offset/dimension decode.
+    """
+
+    total = width * height
+    if total <= 0 or len(bits) != total:
+        return True
+
+    ones = sum(bits)
+    zeros = total - ones
+    minority_value = 1 if ones <= zeros else 0
+    minority_count = min(ones, zeros)
+    minority_ratio = minority_count / total
+
+    # If detail density is not sparse, keep it.
+    if minority_ratio > 0.08:
+        return False
+
+    min_y = height
+    max_y = -1
+    for idx, value in enumerate(bits):
+        if value != minority_value:
+            continue
+        y = idx // width
+        if y < min_y:
+            min_y = y
+        if y > max_y:
+            max_y = y
+
+    if max_y < 0:
+        return True
+
+    band_height = max_y - min_y + 1
+    band_coverage = band_height / height
+    if max_y < int(height * 0.6):
+        return True
+    if band_coverage < 0.5:
+        return True
+
+    return False
+
+
 def _bitmap_to_png_data_uri(bits: list[int], width: int, height: int) -> str | None:
     """Encode a 0/1 bitmap to a PNG data URI if Pillow is available."""
 
@@ -817,6 +1083,15 @@ def _decode_element29_binary_raster(parameters: bytes) -> tuple[str, int, int] |
         return None
 
     width, height = best_size
+    if _is_low_confidence_element29_bitmap(best_bits, width, height):
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "Rejected low-confidence class-4/id-29 raster decode (%dx%d)",
+                width,
+                height,
+            )
+        return None
+
     data_uri = _bitmap_to_png_data_uri(best_bits, width, height)
     if data_uri is None:
         return None
@@ -830,26 +1105,20 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
     restricted_text_items: list[tuple[float, float, float, float, str, str, float]] = []
     polyline_items: list[tuple[list[tuple[float, float]], str, float]] = []
     polygon_items: list[tuple[list[tuple[float, float]], str, float]] = []
+    marker_items: list[tuple[float, float, str, float]] = []
+    rectangle_items: list[tuple[float, float, float, float, str, float]] = []
+    circle_items: list[tuple[float, float, float, str, float]] = []
+    ellipse_items: list[tuple[float, float, float, float, str, float]] = []
     gdp_parameters: list[bytes] = []
-    unsupported_class4: Counter[int] = Counter()
     element29_payloads: list[bytes] = []
-    element29_raster_rendered = False
     vdc_extent: tuple[float, float, float, float] | None = None
     raster_background = _render_raster_background_data_uri(data)
 
     for element in iter_elements(data):
-        if element.class_id == 2 and element.element_id == 6 and len(element.parameters) >= 8:
-            x1 = int.from_bytes(element.parameters[0:2], "big", signed=False)
-            y1 = int.from_bytes(element.parameters[2:4], "big", signed=False)
-            x2 = int.from_bytes(element.parameters[4:6], "big", signed=False)
-            y2 = int.from_bytes(element.parameters[6:8], "big", signed=False)
-            if x1 != x2 and y1 != y2:
-                vdc_extent = (
-                    float(min(x1, x2)),
-                    float(min(y1, y2)),
-                    float(max(x1, x2)),
-                    float(max(y1, y2)),
-                )
+        if element.class_id == 2 and element.element_id == 6:
+            decoded_vdc = _decode_vdc_extent(element.parameters)
+            if decoded_vdc is not None:
+                vdc_extent = decoded_vdc
             continue
 
         if element.class_id == 5:
@@ -869,21 +1138,80 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
             continue
 
         if element.element_id == 1:
-            points = _decode_point_pairs_exact(element.parameters)
+            points = _decode_point_pairs_best(element.parameters, vdc_extent=vdc_extent)
             if len(points) >= 2:
                 polyline_items.append((points, style.stroke_color, style.stroke_width))
+        elif element.element_id == 2:
+            for start, end in _decode_pairwise_segments(element.parameters, vdc_extent=vdc_extent):
+                polyline_items.append(([start, end], style.stroke_color, style.stroke_width))
+        elif element.element_id == 3:
+            points = _decode_point_pairs_best(element.parameters, vdc_extent=vdc_extent)
+            for marker_x, marker_y in points:
+                marker_items.append((marker_x, marker_y, style.stroke_color, style.marker_size))
+        elif element.element_id == 4:
+            appended = _decode_cgm_text(element.parameters)
+            if appended and text_items:
+                last_x, last_y, last_text, last_color, last_font = text_items[-1]
+                text_items[-1] = (last_x, last_y, f"{last_text}{appended}", last_color, last_font)
         elif element.element_id == 7:
-            points = _decode_point_pairs_exact(element.parameters)
+            points = _decode_point_pairs_best(element.parameters, vdc_extent=vdc_extent)
             if len(points) >= 3:
                 polygon_items.append((points, style.stroke_color, style.stroke_width))
-        elif element.element_id == 5 and len(element.parameters) >= 8:
-            x = _parse_f32_be(element.parameters[0:4])
-            y = _parse_f32_be(element.parameters[4:8])
+        elif element.element_id == 8:
+            points = _decode_point_pairs_best(element.parameters, vdc_extent=vdc_extent)
+            if len(points) >= 3:
+                polygon_items.append((points, style.stroke_color, style.stroke_width))
+        elif element.element_id == 5:
+            xy = _decode_xy(element.parameters)
+            if xy is None:
+                continue
+            x, y = xy
             text = _decode_cgm_text(element.parameters[8:])
-            if x is not None and y is not None and text:
+            if text is None:
+                text = _decode_cgm_text(element.parameters[4:])
+            if text:
                 text_items.append((x, y, text, style.stroke_color, style.font_size))
-        elif element.element_id == 26:
+        elif element.element_id == 6:
+            appended = _decode_cgm_text(element.parameters)
+            if appended and text_items:
+                last_x, last_y, last_text, last_color, last_font = text_items[-1]
+                text_items[-1] = (last_x, last_y, f"{last_text}{appended}", last_color, last_font)
+        elif element.element_id in (10, 26):
             gdp_parameters.append(element.parameters)
+        elif element.element_id == 11:
+            corners = _decode_rectangle_corners(element.parameters, vdc_extent=vdc_extent)
+            if corners is None:
+                continue
+            (x1, y1), (x2, y2) = corners
+            rectangle_items.append(
+                (
+                    min(x1, x2),
+                    min(y1, y2),
+                    abs(x2 - x1),
+                    abs(y2 - y1),
+                    style.stroke_color,
+                    style.stroke_width,
+                )
+            )
+        elif element.element_id == 12:
+            circle = _decode_circle_data(element.parameters)
+            if circle is None:
+                continue
+            cx, cy, radius = circle
+            circle_items.append((cx, cy, radius, style.stroke_color, style.stroke_width))
+        elif element.element_id in (13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 27, 28):
+            arc_points = _decode_point_pairs_best(element.parameters, vdc_extent=vdc_extent)
+            if len(arc_points) >= 2:
+                polyline_items.append((arc_points, style.stroke_color, style.stroke_width))
+        elif element.element_id == 9:
+            # Cell Array payloads are handled through raster background extraction.
+            continue
+        elif element.element_id == 17:
+            ellipse = _decode_ellipse_data(element.parameters, vdc_extent=vdc_extent)
+            if ellipse is None:
+                continue
+            cx, cy, rx, ry = ellipse
+            ellipse_items.append((cx, cy, rx, ry, style.stroke_color, style.stroke_width))
         elif element.element_id == 29:
             restricted = _decode_restricted_text(element.parameters)
             if restricted is not None:
@@ -893,21 +1221,28 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
                 )
             else:
                 element29_payloads.append(element.parameters)
-                unsupported_class4[element.element_id] += 1
-        else:
-            unsupported_class4[element.element_id] += 1
 
-    if not polyline_items and not polygon_items:
-        for parameters in gdp_parameters:
-            points = _decode_point_pairs_heuristic(parameters)
-            if len(points) >= 2:
-                polyline_items.append((points, style.stroke_color, style.stroke_width))
+    for parameters in gdp_parameters:
+        points = _decode_gdp_polyline_points(parameters, vdc_extent=vdc_extent)
+        if len(points) >= 2:
+            polyline_items.append((points, style.stroke_color, style.stroke_width))
 
     all_points: list[tuple[float, float]] = []
     for points, _, _ in polyline_items:
         all_points.extend(points)
     for points, _, _ in polygon_items:
         all_points.extend(points)
+    for x, y, _, _ in marker_items:
+        all_points.append((x, y))
+    for x, y, rect_w, rect_h, _, _ in rectangle_items:
+        all_points.append((x, y))
+        all_points.append((x + rect_w, y + rect_h))
+    for cx, cy, radius, _, _ in circle_items:
+        all_points.append((cx - radius, cy - radius))
+        all_points.append((cx + radius, cy + radius))
+    for cx, cy, rx, ry, _, _ in ellipse_items:
+        all_points.append((cx - rx, cy - ry))
+        all_points.append((cx + rx, cy + ry))
     for x, y, _, _, _ in text_items:
         all_points.append((x, y))
     for x, y, box_w, box_h, _, _, _ in restricted_text_items:
@@ -962,10 +1297,37 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
             f'stroke-width="{stroke_width:.3f}" fill="none" />'
         )
 
+    for x, y, marker_color, marker_size in marker_items:
+        svg_lines.append(
+            f'    <circle cx="{x:.3f}" cy="{_map_svg_y(y, min_y=min_y, max_y=max_y):.3f}" '
+            f'r="{marker_size:.3f}" fill="{marker_color}" stroke="none" />'
+        )
+
+    for x, y, rect_w, rect_h, stroke_color, stroke_width in rectangle_items:
+        svg_lines.append(
+            f'    <rect x="{x:.3f}" y="{_map_svg_y(y + rect_h, min_y=min_y, max_y=max_y):.3f}" '
+            f'width="{rect_w:.3f}" height="{rect_h:.3f}" stroke="{stroke_color}" '
+            f'stroke-width="{stroke_width:.3f}" fill="none" />'
+        )
+
+    for cx, cy, radius, stroke_color, stroke_width in circle_items:
+        svg_lines.append(
+            f'    <circle cx="{cx:.3f}" cy="{_map_svg_y(cy, min_y=min_y, max_y=max_y):.3f}" '
+            f'r="{radius:.3f}" stroke="{stroke_color}" stroke-width="{stroke_width:.3f}" '
+            'fill="none" />'
+        )
+
+    for cx, cy, rx, ry, stroke_color, stroke_width in ellipse_items:
+        svg_lines.append(
+            f'    <ellipse cx="{cx:.3f}" cy="{_map_svg_y(cy, min_y=min_y, max_y=max_y):.3f}" '
+            f'rx="{rx:.3f}" ry="{ry:.3f}" stroke="{stroke_color}" '
+            f'stroke-width="{stroke_width:.3f}" fill="none" />'
+        )
+
     svg_lines.append("  </g>")
 
     for x, y, text, stroke_color, font_size in text_items:
-        mapped_y = max_y - (y - min_y)
+        mapped_y = _map_svg_y(y, min_y=min_y, max_y=max_y)
         escaped = html.escape(text)
         svg_lines.append(
             f'  <text x="{x:.3f}" y="{mapped_y:.3f}" '
@@ -974,7 +1336,7 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
         )
 
     for x, y, box_w, box_h, text, stroke_color, font_size in restricted_text_items:
-        mapped_y = max_y - (y - min_y)
+        mapped_y = _map_svg_y(y, min_y=min_y, max_y=max_y)
         box_width = max(1.0, abs(box_w))
         capped_font = max(4.0, min(font_size, abs(box_h)))
         escaped = html.escape(text)
@@ -988,6 +1350,10 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
     if (
         not polyline_items
         and not polygon_items
+        and not marker_items
+        and not rectangle_items
+        and not circle_items
+        and not ellipse_items
         and not text_items
         and not restricted_text_items
         and raster_background is None
@@ -996,7 +1362,6 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
         decoded = _decode_element29_binary_raster(element29_payloads[0])
         if decoded is not None:
             href, raster_width, raster_height = decoded
-            element29_raster_rendered = True
             svg_lines.append(
                 f'  <image x="{min_x:.3f}" y="{min_y:.3f}" width="{width:.3f}" '
                 f'height="{height:.3f}" preserveAspectRatio="xMidYMid meet" '
@@ -1008,63 +1373,6 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
                     raster_width,
                     raster_height,
                 )
-
-    if (
-        not polyline_items
-        and not polygon_items
-        and not text_items
-        and not restricted_text_items
-        and raster_background is None
-        and not element29_raster_rendered
-        and unsupported_class4
-    ):
-        unsupported_summary = ", ".join(
-            f"id {element_id} x{count}" for element_id, count in unsupported_class4.most_common(4)
-        )
-        diagnostics = ""
-        if element29_payloads:
-            analysis = _analyze_element29_payload(element29_payloads[0])
-            ascii_ratio = analysis.get("ascii_ratio", 0.0)
-            entropy_value = analysis.get("entropy_bits_per_byte", 0.0)
-            leading_ff_value = analysis.get("leading_ff_run", 0)
-            ratio = float(ascii_ratio) * 100 if isinstance(ascii_ratio, (int, float)) else 0.0
-            entropy = float(entropy_value) if isinstance(entropy_value, (int, float)) else 0.0
-            leading_ff = int(leading_ff_value) if isinstance(leading_ff_value, int) else 0
-            diagnostics = (
-                f"Element 29 payload looks binary (printable ASCII: {ratio:.1f}%, "
-                f"entropy: {entropy:.2f}, leading 0xFF run: {leading_ff}). "
-                "Expected Restricted Text fields were not detected."
-            )
-        fallback_font = max(10.0, min(24.0, height * 0.04))
-        line_gap = fallback_font * 1.3
-        left = min_x + width * 0.04
-        top = min_y + height * 0.15
-
-        svg_lines.append(
-            f'  <rect x="{min_x:.3f}" y="{min_y:.3f}" width="{width:.3f}" '
-            f'height="{height:.3f}" fill="#f7f7f7" stroke="#666" stroke-width="1" />'
-        )
-        svg_lines.append(
-            f'  <text x="{left:.3f}" y="{top:.3f}" fill="#111" font-size="{fallback_font:.3f}" '
-            'font-family="sans-serif">CGM contains unsupported drawing primitives.</text>'
-        )
-        svg_lines.append(
-            f'  <text x="{left:.3f}" y="{(top + line_gap):.3f}" fill="#333" '
-            f'font-size="{(fallback_font * 0.9):.3f}" font-family="sans-serif">'
-            f"Detected: {html.escape(unsupported_summary)}</text>"
-        )
-
-        if diagnostics:
-            svg_lines.append(
-                f'  <text x="{left:.3f}" y="{(top + line_gap * 2):.3f}" fill="#333" '
-                f'font-size="{(fallback_font * 0.75):.3f}" font-family="sans-serif">'
-                f"{html.escape(diagnostics)}</text>"
-            )
-
-        if log.isEnabledFor(logging.DEBUG):
-            log.debug("SVG fallback used; unsupported class-4 elements: %s", unsupported_summary)
-            if diagnostics:
-                log.debug("Element 29 diagnostics: %s", diagnostics)
 
     svg_lines.append("</svg>")
     return "\n".join(svg_lines) + "\n"
@@ -1706,17 +2014,35 @@ def _render_raw_image_payload(image: RawImage) -> Image.Image | None:
     return None
 
 
+def _coerce_int(value: object, default: int = 1) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return default
+        try:
+            return int(stripped)
+        except ValueError:
+            return default
+    return default
+
+
 def _render_first_text_tile_array(data: bytes) -> Image.Image | None:
     if Image is None:
         return None
 
     for array in _parse_text_tile_arrays(data):
-        cols = int(array.get("cols", 1))
-        rows = int(array.get("rows", 1))
-        tile_w_nominal = int(array.get("tile_width", 1))
-        tile_h_nominal = int(array.get("tile_height", 1))
-        total_w = int(array.get("total_width", 1))
-        total_h = int(array.get("total_height", 1))
+        cols = _coerce_int(array.get("cols", 1))
+        rows = _coerce_int(array.get("rows", 1))
+        tile_w_nominal = _coerce_int(array.get("tile_width", 1))
+        tile_h_nominal = _coerce_int(array.get("tile_height", 1))
+        total_w = _coerce_int(array.get("total_width", 1))
+        total_h = _coerce_int(array.get("total_height", 1))
         tiles = array.get("tiles", [])
         if not isinstance(tiles, list) or not tiles:
             continue
@@ -1811,12 +2137,12 @@ def extract_rendered_images_to_directory(
             arrays_report.append(
                 {
                     "array_index": idx,
-                    "cols": int(array.get("cols", 1)),
-                    "rows": int(array.get("rows", 1)),
-                    "tile_width": int(array.get("tile_width", 1)),
-                    "tile_height": int(array.get("tile_height", 1)),
-                    "total_width": int(array.get("total_width", 1)),
-                    "total_height": int(array.get("total_height", 1)),
+                    "cols": _coerce_int(array.get("cols", 1)),
+                    "rows": _coerce_int(array.get("rows", 1)),
+                    "tile_width": _coerce_int(array.get("tile_width", 1)),
+                    "tile_height": _coerce_int(array.get("tile_height", 1)),
+                    "total_width": _coerce_int(array.get("total_width", 1)),
+                    "total_height": _coerce_int(array.get("total_height", 1)),
                     "tile_count": len(tiles) if isinstance(tiles, list) else 0,
                 }
             )

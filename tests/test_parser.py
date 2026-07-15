@@ -76,3 +76,23 @@ def test_iter_elements_parses_clear_text_bitonal_tile_as_cell_array() -> None:
     assert elements[0].class_id == 4
     assert elements[0].element_id == 9
     assert elements[0].parameters[20:] == bytes.fromhex(hex_payload)
+
+
+def test_iter_elements_parses_clear_text_drawing_primitives() -> None:
+    data = (
+        "DISJOINTPOLYLINE 0 0 10 10; "
+        "POLYMARKER 5 5 7 7; "
+        "POLYGONSET 0 0 10 0 10 10 0 10; "
+        "RECTANGLE 1 2 3 4; "
+        "CIRCLE 20 30 5; "
+        "ARC3PT 0 0 5 10 10 0; "
+        "ARCCENTRE 50 50 55 50 50 55; "
+        "ELLIPSE 70 70 80 70 70 90; "
+        "ELLIPARC 90 90 100 90 90 100 95 90 90 95; "
+        "GDP 1 2 3 4;"
+    ).encode("ascii")
+
+    elements = list(iter_elements(data))
+
+    assert [element.class_id for element in elements] == [4] * 10
+    assert [element.element_id for element in elements] == [2, 3, 8, 11, 12, 13, 15, 17, 18, 10]
