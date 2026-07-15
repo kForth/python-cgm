@@ -112,4 +112,4 @@ TODO
 
 # Debug
 out/
-.test_files/
+test_files/
