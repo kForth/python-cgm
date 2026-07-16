@@ -384,8 +384,45 @@ def test_extract_vector_svg_from_bytes_supports_binary_tile_arrays() -> None:
     svg = extract_vector_svg_from_bytes(data)
 
     assert "<svg" in svg
-    assert "<image" in svg
+    assert svg.count("<image") == 2
     assert 'viewBox="0.000 0.000 4.000 2.000"' in svg
+
+
+def test_extract_vector_svg_from_bytes_maps_tile_images_into_viewbox() -> None:
+    # Add a vector primitive so bounds are not derived from tile dimensions.
+    polyline = _encode_f32(10.0) + _encode_f32(10.0) + _encode_f32(20.0) + _encode_f32(20.0)
+    tile_0 = b"\xc0\xc0"
+    tile_1 = b"\x00\x00"
+    params_0 = (
+        (b"\x00" * 12)
+        + (4).to_bytes(2, "big")
+        + (2).to_bytes(2, "big")
+        + (1).to_bytes(2, "big")
+        + (0).to_bytes(2, "big")
+        + tile_0
+    )
+    params_1 = (
+        (b"\x00" * 12)
+        + (4).to_bytes(2, "big")
+        + (2).to_bytes(2, "big")
+        + (1).to_bytes(2, "big")
+        + (0).to_bytes(2, "big")
+        + tile_1
+    )
+    data = (
+        _header(4, 1, len(polyline))
+        + polyline
+        + _header(4, 9, len(params_0))
+        + params_0
+        + _header(4, 9, len(params_1))
+        + params_1
+    )
+
+    svg = extract_vector_svg_from_bytes(data)
+
+    assert 'viewBox="10.000 10.000 10.000 10.000"' in svg
+    assert '<image x="10.000" y="10.000" width="5.000" height="10.000"' in svg
+    assert '<image x="15.000" y="10.000" width="5.000" height="10.000"' in svg
 
 
 def test_extract_hotspots_from_clear_text_application_data() -> None:

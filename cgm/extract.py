@@ -1231,7 +1231,10 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
     gdp_parameters: list[bytes] = []
     element29_payloads: list[bytes] = []
     vdc_extent: tuple[float, float, float, float] | None = None
-    raster_background = _render_raster_background_data_uri(data)
+    raster_tile_overlays = _render_first_tile_array_overlays(data)
+    raster_background = (
+        None if raster_tile_overlays is not None else _render_raster_background_data_uri(data)
+    )
 
     for element in iter_elements(data):
         if element.class_id == 2 and element.element_id == 6:
@@ -1376,6 +1379,9 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
         max_y = max(point[1] for point in bounds_points)
     elif vdc_extent is not None:
         min_x, min_y, max_x, max_y = vdc_extent
+    elif raster_tile_overlays is not None:
+        _tile_entries, raster_w, raster_h = raster_tile_overlays
+        min_x, min_y, max_x, max_y = 0.0, 0.0, float(raster_w), float(raster_h)
     elif raster_background is not None:
         _href, raster_w, raster_h = raster_background
         min_x, min_y, max_x, max_y = 0.0, 0.0, float(raster_w), float(raster_h)
@@ -1393,7 +1399,23 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
         ),
     ]
 
-    if raster_background is not None:
+    if raster_tile_overlays is not None:
+        tile_entries, tile_total_w, tile_total_h = raster_tile_overlays
+        scale_x = width / max(1.0, float(tile_total_w))
+        scale_y = height / max(1.0, float(tile_total_h))
+        for href, tile_x, tile_y, tile_w, tile_h in tile_entries:
+            mapped_x = min_x + (tile_x * scale_x)
+            mapped_y = min_y + (tile_y * scale_y)
+            mapped_w = max(0.0, tile_w * scale_x)
+            mapped_h = max(0.0, tile_h * scale_y)
+            if mapped_w <= 0.0 or mapped_h <= 0.0:
+                continue
+            svg_lines.append(
+                f'  <image x="{mapped_x:.3f}" y="{mapped_y:.3f}" '
+                f'width="{mapped_w:.3f}" height="{mapped_h:.3f}" preserveAspectRatio="none" '
+                f'image-rendering="pixelated" href="{href}" />'
+            )
+    elif raster_background is not None:
         href, _raster_w, _raster_h = raster_background
         svg_lines.append(
             f'  <image x="{min_x:.3f}" y="{min_y:.3f}" width="{width:.3f}" '
@@ -2299,6 +2321,71 @@ def _render_first_tile_array(data: bytes) -> Image.Image | None:
 
         if pasted_any:
             return canvas
+
+    return None
+
+
+def _render_first_tile_array_overlays(
+    data: bytes,
+) -> tuple[list[tuple[str, float, float, float, float]], int, int] | None:
+    """Decode first available tile array and return per-tile SVG overlays."""
+    for array in _parse_tile_arrays(data):
+        cols = _coerce_int(array.get("cols", 1))
+        rows = _coerce_int(array.get("rows", 1))
+        tile_w_nominal = _coerce_int(array.get("tile_width", 1))
+        tile_h_nominal = _coerce_int(array.get("tile_height", 1))
+        total_w = _coerce_int(array.get("total_width", 1))
+        total_h = _coerce_int(array.get("total_height", 1))
+        tiles = array.get("tiles", [])
+        if not isinstance(tiles, list) or not tiles:
+            continue
+
+        overlays: list[tuple[str, float, float, float, float]] = []
+
+        for tile_index, tile_payload in enumerate(tiles[: rows * cols]):
+            if not isinstance(tile_payload, dict):
+                continue
+
+            payload = tile_payload.get("payload")
+            compression = tile_payload.get("compression")
+            bit_order = tile_payload.get("bit_order")
+            if not isinstance(payload, (bytes, bytearray)):
+                continue
+
+            tile_img = _decode_bitonal_payload_to_image(
+                bytes(payload),
+                tile_w_nominal,
+                tile_h_nominal,
+                compression=compression if isinstance(compression, int) else None,
+                bit_order=bit_order if isinstance(bit_order, int) else None,
+            )
+            if tile_img is None:
+                continue
+
+            row = tile_index // cols
+            col = tile_index % cols
+            x = col * tile_w_nominal
+            y = row * tile_h_nominal
+            if x >= total_w or y >= total_h:
+                continue
+
+            paste_w = min(tile_img.width, total_w - x)
+            paste_h = min(tile_img.height, total_h - y)
+            if paste_w <= 0 or paste_h <= 0:
+                continue
+
+            tile_for_svg = tile_img
+            if tile_img.size != (paste_w, paste_h):
+                tile_for_svg = tile_img.crop((0, 0, paste_w, paste_h))
+
+            href = _image_to_png_data_uri(tile_for_svg)
+            if href is None:
+                continue
+
+            overlays.append((href, float(x), float(y), float(paste_w), float(paste_h)))
+
+        if overlays:
+            return overlays, total_w, total_h
 
     return None
 
