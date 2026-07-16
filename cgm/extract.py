@@ -486,6 +486,27 @@ def _map_svg_y(y: float, *, min_y: float, max_y: float) -> float:
     return max_y - (y - min_y)
 
 
+def _filter_points_for_bounds(
+    points: list[tuple[float, float]],
+    *,
+    vdc_extent: tuple[float, float, float, float] | None,
+) -> list[tuple[float, float]]:
+    """Prefer points near declared VDC extent when computing SVG bounds."""
+    if not points or vdc_extent is None:
+        return points
+
+    min_x, min_y, max_x, max_y = vdc_extent
+    span = max(1.0, max_x - min_x, max_y - min_y)
+    margin = span * 0.25
+    low_x = min_x - margin
+    high_x = max_x + margin
+    low_y = min_y - margin
+    high_y = max_y + margin
+
+    filtered = [(x, y) for x, y in points if (low_x <= x <= high_x) and (low_y <= y <= high_y)]
+    return filtered if filtered else points
+
+
 def _decode_i16_be(value: bytes) -> int | None:
     if len(value) != 2:
         return None
@@ -600,7 +621,11 @@ def _decode_xy(parameters: bytes) -> tuple[float, float] | None:
     if len(parameters) >= 8:
         x = _parse_f32_be(parameters[0:4])
         y = _parse_f32_be(parameters[4:8])
-        if x is not None and y is not None:
+        # Some binary profiles encode TEXT anchors with integer VDCs and leave
+        # additional bytes that can decode to huge-but-finite float garbage.
+        # Treat implausibly large float coordinates as invalid and fall back to
+        # i16 decoding.
+        if x is not None and y is not None and abs(x) <= 1_000_000 and abs(y) <= 1_000_000:
             return x, y
     if len(parameters) >= 4:
         x_i16 = _decode_i16_be(parameters[0:2])
@@ -825,6 +850,100 @@ def _analyze_element29_payload(parameters: bytes) -> dict[str, object]:
         "restricted_text_detected": restricted is not None,
         "likely_binary_payload": ascii_ratio < 0.45 and entropy > 6.5,
     }
+
+
+def _collect_element29_decode_candidates(
+    parameters: bytes,
+    *,
+    limit: int = 8,
+) -> list[dict[str, object]]:
+    """Collect top decode candidates for class-4/id-29 payload diagnostics."""
+
+    if imagecodecs is None or not parameters:
+        return []
+
+    candidate_offsets = [
+        *range(0, 33),
+        157,
+        158,
+        159,
+        160,
+        161,
+        176,
+        184,
+        188,
+        192,
+        196,
+        200,
+        208,
+        224,
+        240,
+        256,
+    ]
+    candidate_sizes = [
+        (768, 1099),
+        (767, 1099),
+        (768, 1100),
+        (576, 768),
+        (575, 767),
+    ]
+
+    ranked: list[tuple[float, bool, float, dict[str, object]]] = []
+
+    for offset in candidate_offsets:
+        payload = parameters[offset:]
+        if not payload:
+            continue
+
+        for width, height in candidate_sizes:
+            decode_attempts: list[tuple[bytes, str]] = []
+            try:
+                decode_attempts.append(
+                    (
+                        bytes(imagecodecs.ccittfax4_decode(payload, height=height, width=width)),
+                        "fax4",
+                    )
+                )
+            except (RuntimeError, ValueError):
+                pass
+
+            for t4options in (0, 2, 4, 6, 1, 3, 5, 7):
+                try:
+                    decoded = imagecodecs.ccittfax3_decode(
+                        payload,
+                        height=height,
+                        width=width,
+                        t4options=t4options,
+                    )
+                    decode_attempts.append((bytes(decoded), f"fax3:{t4options}"))
+                except (RuntimeError, ValueError):
+                    continue
+
+            for decoded, decoder_name in decode_attempts:
+                bits = _decode_fax_output_to_bitmap(decoded, width, height)
+                if bits is None:
+                    continue
+
+                for invert in (False, True):
+                    candidate = [1 - bit for bit in bits] if invert else bits
+                    score = _score_bitmap(candidate, width, height)
+                    black_ratio = sum(candidate) / len(candidate)
+                    low_confidence = _is_low_confidence_element29_bitmap(candidate, width, height)
+
+                    candidate_info = {
+                        "offset": offset,
+                        "width": width,
+                        "height": height,
+                        "decoder": decoder_name,
+                        "invert": invert,
+                        "score": round(score, 6),
+                        "black_ratio": round(black_ratio, 6),
+                        "low_confidence": low_confidence,
+                    }
+                    ranked.append((score, low_confidence, abs(black_ratio - 0.5), candidate_info))
+
+    ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+    return [entry for *_meta, entry in ranked[: max(1, limit)]]
 
 
 def _decode_fax_output_to_bitmap(output: bytes, width: int, height: int) -> list[int] | None:
@@ -1250,10 +1369,11 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
         all_points.append((x + box_w, y + box_h))
 
     if all_points:
-        min_x = min(point[0] for point in all_points)
-        max_x = max(point[0] for point in all_points)
-        min_y = min(point[1] for point in all_points)
-        max_y = max(point[1] for point in all_points)
+        bounds_points = _filter_points_for_bounds(all_points, vdc_extent=vdc_extent)
+        min_x = min(point[0] for point in bounds_points)
+        max_x = max(point[0] for point in bounds_points)
+        min_y = min(point[1] for point in bounds_points)
+        max_y = max(point[1] for point in bounds_points)
     elif vdc_extent is not None:
         min_x, min_y, max_x, max_y = vdc_extent
     elif raster_background is not None:
@@ -1422,10 +1542,15 @@ def _build_data_snapshot(data: bytes) -> dict[str, object]:
             }
         )
         if element.class_id == 4 and element.element_id == 29:
+            candidates = _collect_element29_decode_candidates(element.parameters)
             element29_analysis.append(
                 {
                     "offset": element.offset,
                     **_analyze_element29_payload(element.parameters),
+                    "decode_candidates": candidates,
+                    "has_plausible_decode": any(
+                        not item.get("low_confidence", True) for item in candidates
+                    ),
                 }
             )
 
@@ -1671,6 +1796,90 @@ def _tile_axis_sizes(total: int, count: int) -> list[int]:
     base = max(1, total // count)
     remainder = max(0, total - (base * count))
     return [base + (1 if idx < remainder else 0) for idx in range(count)]
+
+
+def _infer_tile_grid(tile_count: int, total_w: int, total_h: int) -> tuple[int, int]:
+    if tile_count <= 1:
+        return 1, 1
+
+    target_aspect = (total_w / total_h) if total_h > 0 else float(total_w)
+    best_cols = 1
+    best_rows = tile_count
+    best_error = float("inf")
+
+    for rows in range(1, tile_count + 1):
+        if tile_count % rows != 0:
+            continue
+        cols = tile_count // rows
+        aspect = cols / rows
+        error = abs(aspect - target_aspect)
+        if error < best_error:
+            best_error = error
+            best_cols = cols
+            best_rows = rows
+
+    return best_cols, best_rows
+
+
+def _parse_binary_tile_arrays(data: bytes) -> list[dict[str, object]]:
+    """Synthesize tile-array metadata from binary Cell Array sequences."""
+    tiles: list[dict[str, object]] = []
+    common_total_w: int | None = None
+    common_total_h: int | None = None
+
+    for element in iter_elements(data):
+        if element.class_id != CELL_ARRAY_CLASS_ID or element.element_id != CELL_ARRAY_ELEMENT_ID:
+            continue
+
+        width, height, payload_offset = _parse_cell_array_hints(element.parameters)
+        payload = (
+            element.parameters[payload_offset:] if payload_offset < len(element.parameters) else b""
+        )
+        if not payload:
+            continue
+
+        if width is not None and width > 0:
+            common_total_w = width if common_total_w is None else common_total_w
+        if height is not None and height > 0:
+            common_total_h = height if common_total_h is None else common_total_h
+
+        tiles.append(
+            {
+                "payload": payload,
+                "compression": None,
+                "bit_order": None,
+                "orientation": None,
+            }
+        )
+
+    if len(tiles) < 2:
+        return []
+
+    total_w = common_total_w if isinstance(common_total_w, int) and common_total_w > 0 else 1
+    total_h = common_total_h if isinstance(common_total_h, int) and common_total_h > 0 else 1
+    cols, rows = _infer_tile_grid(len(tiles), total_w, total_h)
+    tile_w = max(1, total_w // max(1, cols))
+    tile_h = max(1, total_h // max(1, rows))
+
+    return [
+        {
+            "cols": cols,
+            "rows": rows,
+            "tile_width": tile_w,
+            "tile_height": tile_h,
+            "total_width": total_w,
+            "total_height": total_h,
+            "tiles": tiles,
+        }
+    ]
+
+
+def _parse_tile_arrays(data: bytes) -> list[dict[str, object]]:
+    """Parse tile-array metadata from text commands or synthesized binary hints."""
+    text_arrays = _parse_text_tile_arrays(data)
+    if text_arrays:
+        return text_arrays
+    return _parse_binary_tile_arrays(data)
 
 
 def _parse_text_tile_arrays(data: bytes) -> list[dict[str, object]]:
@@ -2032,11 +2241,11 @@ def _coerce_int(value: object, default: int = 1) -> int:
     return default
 
 
-def _render_first_text_tile_array(data: bytes) -> Image.Image | None:
+def _render_first_tile_array(data: bytes) -> Image.Image | None:
     if Image is None:
         return None
 
-    for array in _parse_text_tile_arrays(data):
+    for array in _parse_tile_arrays(data):
         cols = _coerce_int(array.get("cols", 1))
         rows = _coerce_int(array.get("rows", 1))
         tile_w_nominal = _coerce_int(array.get("tile_width", 1))
@@ -2095,7 +2304,7 @@ def _render_first_text_tile_array(data: bytes) -> Image.Image | None:
 
 
 def _render_raster_background_data_uri(data: bytes) -> tuple[str, int, int] | None:
-    tiled = _render_first_text_tile_array(data)
+    tiled = _render_first_tile_array(data)
     if tiled is not None:
         href = _image_to_png_data_uri(tiled)
         if href is not None:
@@ -2132,7 +2341,7 @@ def extract_rendered_images_to_directory(
 
     if debug_report:
         arrays_report: list[dict[str, object]] = []
-        for idx, array in enumerate(_parse_text_tile_arrays(raw)):
+        for idx, array in enumerate(_parse_tile_arrays(raw)):
             tiles = array.get("tiles", [])
             arrays_report.append(
                 {

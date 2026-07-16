@@ -6,6 +6,7 @@ __license__ = "BSD-3-Clause"
 
 import inspect
 import json
+import re
 import struct
 from typing import TYPE_CHECKING
 
@@ -357,6 +358,36 @@ def test_extract_raw_images_from_clear_text_cellarray() -> None:
     assert images[0].payload == b"\x01\x02\x03\x04"
 
 
+def test_extract_vector_svg_from_bytes_supports_binary_tile_arrays() -> None:
+    # Two binary Cell Array payloads representing a tiled 4x2 canvas.
+    # Each tile is encoded as packed 1-bit rows (2 bytes for a 2x2 tile).
+    tile_0 = b"\xc0\xc0"
+    tile_1 = b"\x00\x00"
+    params_0 = (
+        (b"\x00" * 12)
+        + (4).to_bytes(2, "big")
+        + (2).to_bytes(2, "big")
+        + (1).to_bytes(2, "big")
+        + (0).to_bytes(2, "big")
+        + tile_0
+    )
+    params_1 = (
+        (b"\x00" * 12)
+        + (4).to_bytes(2, "big")
+        + (2).to_bytes(2, "big")
+        + (1).to_bytes(2, "big")
+        + (0).to_bytes(2, "big")
+        + tile_1
+    )
+    data = _header(4, 9, len(params_0)) + params_0 + _header(4, 9, len(params_1)) + params_1
+
+    svg = extract_vector_svg_from_bytes(data)
+
+    assert "<svg" in svg
+    assert "<image" in svg
+    assert 'viewBox="0.000 0.000 4.000 2.000"' in svg
+
+
 def test_extract_hotspots_from_clear_text_application_data() -> None:
     data = b'BEGAPS "SPOT_TEXT"; APD "name" "ZONE_TEXT"; APD "region" "10 20 30 40"; ENDAPS;'
 
@@ -450,6 +481,24 @@ def test_element29_binary_fallback_rejects_low_confidence_gr_283383() -> None:
     assert decode_element29(payload) is None
 
 
+def test_gr_283383_data_snapshot_includes_element29_decode_diagnostics() -> None:
+    from pathlib import Path  # noqa: PLC0415
+
+    root = Path(__file__).resolve().parents[1]
+    candidates = [
+        root / "sample" / "GR-283383.cgm",
+        root / "test_files" / "GR-283383.cgm",
+    ]
+    source = next((path for path in candidates if path.exists()), candidates[0])
+
+    snapshot = json.loads(extract_data_json_from_bytes(source.read_bytes()))
+    element29 = snapshot["element29_analysis"][0]
+
+    assert "decode_candidates" in element29
+    assert element29["decode_candidates"]
+    assert element29["has_plausible_decode"] is False
+
+
 def test_gr_283383_skips_unsupported_fallback_rendering() -> None:
     from pathlib import Path  # noqa: PLC0415
 
@@ -482,6 +531,11 @@ def test_gr_78946_renders_binary_text_and_arcs() -> None:
     assert "<text " in svg
     assert "<polyline" in svg or "<polygon" in svg
     assert "unsupported drawing primitives" not in svg
+    match = re.search(r'viewBox="([^"]+)"', svg)
+    assert match is not None
+    _x, _y, width, height = (float(part) for part in match.group(1).split())
+    assert width < 10_000_000
+    assert height < 1_000_000
 
 
 def test_extract_raw_images_from_clear_text_bitonal_tiles() -> None:
