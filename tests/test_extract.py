@@ -4,7 +4,10 @@ __author__ = "Kestin Goforth"
 __copyright__ = "Copyright 2026"
 __license__ = "BSD-3-Clause"
 
+import base64
+import importlib
 import inspect
+import io
 import json
 import re
 import struct
@@ -55,7 +58,39 @@ def test_extract_raw_images_from_bytes_reads_cell_array_payload() -> None:
     assert len(images) == 1
     assert images[0].width == 2
     assert images[0].height == 3
+    assert images[0].local_color_precision == 0
+    assert images[0].cell_representation_mode == 0
     assert images[0].payload == b"PAYLOAD"
+
+
+def test_extract_raw_images_from_clear_text_cellarray_preserves_metadata() -> None:
+    data = b"CELLARRAY 0 0 1 0 0 1 2 2 8 1 2 3 4;"
+
+    images = extract_raw_images_from_bytes(data)
+
+    assert len(images) == 1
+    assert images[0].width == 2
+    assert images[0].height == 2
+    assert images[0].local_color_precision == 8
+    assert images[0].cell_representation_mode == 0
+
+
+def test_render_raw_image_payload_prefers_indexed_when_precision_is_8bit() -> None:
+    raw = extract_module.RawImage(
+        index=0,
+        element_offset=0,
+        payload=bytes([0, 1, 2, 3]),
+        width=2,
+        height=2,
+        local_color_precision=8,
+        cell_representation_mode=0,
+    )
+
+    image = extract_module._render_raw_image_payload(raw)
+
+    assert image is not None
+    assert image.mode == "P"
+    assert image.size == (2, 2)
 
 
 def test_extract_vector_svg_from_bytes_emits_svg_document() -> None:
@@ -302,6 +337,104 @@ def test_extract_vector_svg_from_bytes_supports_additional_primitives() -> None:
     assert svg.count("<circle") >= 2
 
 
+def test_extract_vector_svg_from_bytes_applies_binary_color_table_to_line_color() -> None:
+    # Class 5 / element 34 (Color Table): start index 10 => RGB(255,0,0).
+    color_table = bytes([10, 255, 0, 0])
+    line_color = bytes([10, 0])
+    points = _encode_f32(0.0) + _encode_f32(0.0) + _encode_f32(10.0) + _encode_f32(10.0)
+    data = (
+        _header(5, 34, len(color_table))
+        + color_table
+        + _header(5, 4, len(line_color))
+        + line_color
+        + _header(4, 1, len(points))
+        + points
+    )
+
+    svg = extract_vector_svg_from_bytes(data)
+
+    assert 'stroke="#ff0000"' in svg
+
+
+def test_extract_color_table_handles_16bit_components() -> None:
+    data = bytearray()
+    color_table = bytes([0, 2]) + bytes.fromhex("ffff00008000")
+    data += _header(5, 34, len(color_table)) + color_table
+
+    table = extract_module._extract_color_table(bytes(data))
+
+    assert table.get(2) == (255, 0, 128)
+
+
+def test_extract_color_value_extent_from_binary_and_clear_text() -> None:
+    binary = _header(1, 10, 12) + b"\x00\x00\x00\x00\x00\x00\x0f\xff\x0f\xff\x0f\xff"
+    clear_text = b"COLRVALUEEXT 0 0 0 4095 4095 4095;"
+
+    binary_extent = extract_module._extract_color_value_extent(binary)
+    clear_text_extent = extract_module._extract_color_value_extent(clear_text)
+
+    assert binary_extent == (0, 0, 0, 4095, 4095, 4095)
+    assert clear_text_extent == (0, 0, 0, 4095, 4095, 4095)
+
+
+def test_extract_vector_svg_from_clear_text_applies_color_table_to_line_color() -> None:
+    data = b"COLRTABLE 10 255 0 0; LINECOLR 10; LINE 0 0 10 10;"
+
+    svg = extract_vector_svg_from_bytes(data)
+
+    assert 'stroke="#ff0000"' in svg
+
+
+def test_extract_vector_svg_from_bytes_respects_binary_transparency_mode() -> None:
+    transparency_off = _header(3, 4, 1) + b"\x00"
+    line = (
+        _header(4, 1, 16)
+        + _encode_f32(0.0)
+        + _encode_f32(0.0)
+        + _encode_f32(10.0)
+        + _encode_f32(10.0)
+    )
+
+    svg = extract_vector_svg_from_bytes(transparency_off + b"\x00" + line)
+
+    assert 'fill="#ffffff"' in svg
+    assert "<polyline" in svg
+
+
+def test_extract_vector_svg_from_clear_text_respects_transparency_mode() -> None:
+    svg_off = extract_vector_svg_from_bytes(b"TRANSPARENCY OFF; LINE 0 0 10 10;")
+    svg_on = extract_vector_svg_from_bytes(b"TRANSPARENCY ON; LINE 0 0 10 10;")
+
+    assert 'fill="#ffffff"' in svg_off
+    assert 'fill="#ffffff"' not in svg_on
+
+
+def test_extract_vector_svg_from_bytes_respects_binary_clip_settings() -> None:
+    clip_rect = _header(3, 5, 8) + b"\x00\x02\x00\x02\x00\x08\x00\x08"
+    clip_on = _header(3, 6, 1) + b"\x01" + b"\x00"
+    line = (
+        _header(4, 1, 16)
+        + _encode_f32(0.0)
+        + _encode_f32(0.0)
+        + _encode_f32(10.0)
+        + _encode_f32(10.0)
+    )
+
+    svg = extract_vector_svg_from_bytes(clip_rect + clip_on + line)
+
+    assert '<clipPath id="cgmClip0">' in svg
+    assert 'clip-path="url(#cgmClip0)"' in svg
+
+
+def test_extract_vector_svg_from_clear_text_respects_clip_commands() -> None:
+    svg_on = extract_vector_svg_from_bytes(b"CLIPRECT 2 2 8 8; CLIPIND ON; LINE 0 0 10 10;")
+    svg_off = extract_vector_svg_from_bytes(b"CLIPRECT 2 2 8 8; CLIPIND OFF; LINE 0 0 10 10;")
+
+    assert '<clipPath id="cgmClip0">' in svg_on
+    assert 'clip-path="url(#cgmClip0)"' in svg_on
+    assert '<clipPath id="cgmClip0">' not in svg_off
+
+
 def test_extract_vector_svg_from_bytes_supports_binary_integer_polyline() -> None:
     # Binary streams often encode VDC coordinates as 16-bit signed integers.
     points_i16 = (
@@ -316,6 +449,27 @@ def test_extract_vector_svg_from_bytes_supports_binary_integer_polyline() -> Non
 
     assert "<svg" in svg
     assert "<polyline" in svg
+
+
+def test_extract_vector_svg_from_bytes_supports_binary_integer32_polyline() -> None:
+    points_i32 = (
+        (2_500_000).to_bytes(4, "big", signed=True)
+        + (2_500_000).to_bytes(4, "big", signed=True)
+        + (2_600_000).to_bytes(4, "big", signed=True)
+        + (2_600_000).to_bytes(4, "big", signed=True)
+    )
+    extent = (
+        _encode_f32(2_400_000.0)
+        + _encode_f32(2_400_000.0)
+        + _encode_f32(2_700_000.0)
+        + _encode_f32(2_700_000.0)
+    )
+    data = _header(2, 6, len(extent)) + extent + _header(4, 1, len(points_i32)) + points_i32
+
+    svg = extract_vector_svg_from_bytes(data)
+
+    assert "<svg" in svg
+    assert '<polyline points="2500000.000,2600000.000 2600000.000,2500000.000"' in svg
 
 
 def test_extract_vector_svg_from_bytes_supports_extended_binary_arc_family() -> None:
@@ -388,6 +542,116 @@ def test_extract_vector_svg_from_bytes_supports_binary_tile_arrays() -> None:
     assert 'viewBox="0.000 0.000 4.000 2.000"' in svg
 
 
+def test_parse_binary_tile_arrays_marks_one_byte_tiles_as_indexed() -> None:
+    tile_0 = bytes([0, 1, 2, 3])
+    tile_1 = bytes([3, 2, 1, 0])
+    params_0 = (
+        (b"\x00" * 12)
+        + (4).to_bytes(2, "big")
+        + (2).to_bytes(2, "big")
+        + (1).to_bytes(2, "big")
+        + (0).to_bytes(2, "big")
+        + tile_0
+    )
+    params_1 = (
+        (b"\x00" * 12)
+        + (4).to_bytes(2, "big")
+        + (2).to_bytes(2, "big")
+        + (1).to_bytes(2, "big")
+        + (0).to_bytes(2, "big")
+        + tile_1
+    )
+    data = _header(4, 9, len(params_0)) + params_0 + _header(4, 9, len(params_1)) + params_1
+
+    arrays = extract_module._parse_binary_tile_arrays(data)
+
+    assert len(arrays) == 1
+    first_tile = arrays[0]["tiles"][0]
+    assert isinstance(first_tile, dict)
+    assert first_tile["family"] == "indexed"
+    decoded = extract_module._decode_tile_payload_to_image(
+        first_tile["payload"],
+        arrays[0]["tile_width"],
+        arrays[0]["tile_height"],
+        family=first_tile["family"],
+    )
+    assert decoded is not None
+    assert decoded.mode == "P"
+
+
+def test_parse_binary_tile_arrays_preserves_precision_and_representation_mode() -> None:
+    payload = bytes([255, 0, 0])
+    params = (
+        (b"\x00" * 12)
+        + (1).to_bytes(2, "big")
+        + (1).to_bytes(2, "big")
+        + (24).to_bytes(2, "big")
+        + (1).to_bytes(2, "big")
+        + payload
+    )
+    data = _header(4, 9, len(params)) + params
+
+    arrays = extract_module._parse_binary_tile_arrays(data)
+
+    assert len(arrays) == 1
+    tiles = arrays[0]["tiles"]
+    assert isinstance(tiles, list)
+    first_tile = tiles[0]
+    assert isinstance(first_tile, dict)
+    assert first_tile.get("local_color_precision") == 24
+    assert first_tile.get("cell_representation_mode") == 1
+
+
+def test_parse_text_tile_arrays_preserves_precision_and_representation_mode() -> None:
+    payload = "FF0000" * 12
+    data = (
+        "BEGTILEARRAY 0 0 0 0 1 1 1 1 0 0 0 0 1 1; "
+        f"COLORTILE 2 24 0 1 1 '' {payload}; "
+        "ENDTILEARRAY;"
+    ).encode("ascii")
+
+    arrays = extract_module._parse_text_tile_arrays(data)
+
+    assert len(arrays) == 1
+    tiles = arrays[0]["tiles"]
+    assert isinstance(tiles, list)
+    first_tile = tiles[0]
+    assert isinstance(first_tile, dict)
+    assert first_tile.get("local_color_precision") == 24
+    assert first_tile.get("cell_representation_mode") == 1
+
+
+def test_extract_vector_svg_from_bytes_supports_binary_direct_color_tile_arrays() -> None:
+    # Two RGB tiles composing a 2x1 canvas.
+    tile_0 = bytes([255, 0, 0])
+    tile_1 = bytes([0, 255, 0])
+    params_0 = (
+        (b"\x00" * 12)
+        + (2).to_bytes(2, "big")
+        + (1).to_bytes(2, "big")
+        + (24).to_bytes(2, "big")
+        + (0).to_bytes(2, "big")
+        + tile_0
+    )
+    params_1 = (
+        (b"\x00" * 12)
+        + (2).to_bytes(2, "big")
+        + (1).to_bytes(2, "big")
+        + (24).to_bytes(2, "big")
+        + (0).to_bytes(2, "big")
+        + tile_1
+    )
+    data = (
+        _header(4, 9, len(params_0)) + params_0 + b"\x00" + _header(4, 9, len(params_1)) + params_1
+    )
+
+    svg = extract_vector_svg_from_bytes(data)
+
+    assert "<svg" in svg
+    assert svg.count("<image") == 2
+    assert 'viewBox="0.000 0.000 2.000 1.000"' in svg
+
+
 def test_extract_vector_svg_from_bytes_maps_tile_images_into_viewbox() -> None:
     # Add a vector primitive so bounds are not derived from tile dimensions.
     polyline = _encode_f32(10.0) + _encode_f32(10.0) + _encode_f32(20.0) + _encode_f32(20.0)
@@ -423,6 +687,20 @@ def test_extract_vector_svg_from_bytes_maps_tile_images_into_viewbox() -> None:
     assert 'viewBox="10.000 10.000 10.000 10.000"' in svg
     assert '<image x="10.000" y="10.000" width="5.000" height="10.000"' in svg
     assert '<image x="15.000" y="10.000" width="5.000" height="10.000"' in svg
+
+
+def test_extract_vector_svg_from_bytes_preserves_out_of_range_point_coordinates() -> None:
+    extent = (
+        _encode_f32(2_000_000.0) + _encode_f32(-1.0) + _encode_f32(3_000_000.0) + _encode_f32(1.0)
+    )
+    points = (
+        _encode_f32(2_500_000.0) + _encode_f32(0.0) + _encode_f32(2_600_000.0) + _encode_f32(0.0)
+    )
+    data = _header(2, 6, len(extent)) + extent + _header(4, 1, len(points)) + points
+
+    svg = extract_vector_svg_from_bytes(data)
+
+    assert "2500000.000,0.000" in svg
 
 
 def test_extract_hotspots_from_clear_text_application_data() -> None:
@@ -536,7 +814,7 @@ def test_gr_283383_data_snapshot_includes_element29_decode_diagnostics() -> None
     assert element29["has_plausible_decode"] is False
 
 
-def test_gr_283383_skips_unsupported_fallback_rendering() -> None:
+def test_gr_283383_renders_class_29_fallback_image() -> None:
     from pathlib import Path  # noqa: PLC0415
 
     root = Path(__file__).resolve().parents[1]
@@ -548,9 +826,111 @@ def test_gr_283383_skips_unsupported_fallback_rendering() -> None:
 
     svg = extract_vector_svg_from_bytes(source.read_bytes())
 
-    assert "<image " not in svg
+    assert "<image " in svg
     assert "unsupported drawing primitives" not in svg
     assert "POSID_" not in svg
+
+
+def test_extract_vector_svg_from_bytes_tries_multiple_element29_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = b"FIRST_PAYLOAD0"
+    second = b"SECOND_PAYLOAD0"
+    data = _header(4, 29, len(first)) + first + _header(4, 29, len(second)) + second
+
+    calls: list[tuple[bytes, bool]] = []
+
+    def _fake_decode(
+        parameters: bytes,
+        *,
+        allow_low_confidence: bool = False,
+    ) -> tuple[str, int, int] | None:
+        calls.append((parameters, allow_low_confidence))
+        if parameters == second and not allow_low_confidence:
+            return "data:image/png;base64,AAAA", 2, 1
+        return None
+
+    monkeypatch.setattr(extract_module, "_decode_element29_binary_raster", _fake_decode)
+
+    svg = extract_vector_svg_from_bytes(data)
+
+    assert "<image " in svg
+    assert 'href="data:image/png;base64,AAAA"' in svg
+    assert calls[0] == (first, False)
+    assert calls[1] == (second, False)
+
+
+def test_extract_vector_svg_from_bytes_element29_fallback_uses_low_confidence_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"LOWCONF_PAYLOAD0"
+    data = _header(4, 29, len(payload)) + payload
+
+    calls: list[bool] = []
+
+    def _fake_decode(
+        parameters: bytes,
+        *,
+        allow_low_confidence: bool = False,
+    ) -> tuple[str, int, int] | None:
+        assert parameters == payload
+        calls.append(allow_low_confidence)
+        if allow_low_confidence:
+            return "data:image/png;base64,BBBB", 2, 1
+        return None
+
+    monkeypatch.setattr(extract_module, "_decode_element29_binary_raster", _fake_decode)
+
+    svg = extract_vector_svg_from_bytes(data)
+
+    assert "<image " in svg
+    assert 'href="data:image/png;base64,BBBB"' in svg
+    assert calls == [False, True]
+
+
+def test_decode_best_element29_fallback_uses_real_fixture_payload_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pathlib import Path  # noqa: PLC0415
+
+    root = Path(__file__).resolve().parents[1]
+    candidates = [
+        root / "sample" / "GR-77775.cgm",
+        root / "test_files" / "GR-77775.cgm",
+    ]
+    source = next((path for path in candidates if path.exists()), candidates[0])
+
+    payloads = [
+        element.parameters
+        for element in extract_module.iter_elements(source.read_bytes())
+        if element.class_id == 4 and element.element_id == 29
+    ]
+    assert len(payloads) >= 2
+
+    calls: list[tuple[bytes, bool]] = []
+    target = payloads[1]
+
+    def _fake_decode(
+        parameters: bytes,
+        *,
+        allow_low_confidence: bool = False,
+    ) -> tuple[str, int, int] | None:
+        calls.append((parameters, allow_low_confidence))
+        if parameters == target and not allow_low_confidence:
+            return "data:image/png;base64,CCCC", 2, 1
+        return None
+
+    monkeypatch.setattr(extract_module, "_decode_element29_binary_raster", _fake_decode)
+
+    decoded = extract_module._decode_best_element29_fallback(payloads)
+
+    assert decoded is not None
+    href, width, height = decoded
+    assert href == "data:image/png;base64,CCCC"
+    assert width == 2
+    assert height == 1
+    assert calls[0] == (payloads[0], False)
+    assert calls[1] == (payloads[1], False)
 
 
 def test_gr_78946_renders_binary_text_and_arcs() -> None:
@@ -575,6 +955,57 @@ def test_gr_78946_renders_binary_text_and_arcs() -> None:
     assert height < 1_000_000
 
 
+def test_gr_78946_text_anchors_land_inside_viewbox() -> None:
+    from pathlib import Path  # noqa: PLC0415
+
+    root = Path(__file__).resolve().parents[1]
+    candidates = [
+        root / "sample" / "GR-78946.cgm",
+        root / "test_files" / "GR-78946.cgm",
+    ]
+    source = next((path for path in candidates if path.exists()), candidates[0])
+
+    svg = extract_vector_svg_from_bytes(source.read_bytes())
+
+    view_match = re.search(r'viewBox="([^"]+)"', svg)
+    assert view_match is not None
+    min_x, min_y, width, height = (float(part) for part in view_match.group(1).split())
+    max_x = min_x + width
+    max_y = min_y + height
+
+    text_items = re.findall(r'<text x="([^"]+)" y="([^"]+)"', svg)
+    assert text_items
+    in_view = 0
+    for x_text, y_text in text_items:
+        x = float(x_text)
+        y = float(y_text)
+        if min_x <= x <= max_x and min_y <= y <= max_y:
+            in_view += 1
+
+    assert in_view >= max(1, len(text_items) // 2)
+
+
+def test_gr_78946_does_not_emit_noisy_massive_polylines() -> None:
+    from pathlib import Path  # noqa: PLC0415
+
+    root = Path(__file__).resolve().parents[1]
+    candidates = [
+        root / "sample" / "GR-78946.cgm",
+        root / "test_files" / "GR-78946.cgm",
+    ]
+    source = next((path for path in candidates if path.exists()), candidates[0])
+
+    svg = extract_vector_svg_from_bytes(source.read_bytes())
+
+    point_cloud_sizes = [
+        len(points.split()) for points in re.findall(r'<polyline points="([^"]+)"', svg)
+    ]
+    if point_cloud_sizes:
+        assert max(point_cloud_sizes) < 200
+    else:
+        assert "<polygon" in svg
+
+
 def test_extract_raw_images_from_clear_text_bitonal_tiles() -> None:
     hex_payload = "0123456789ABCDEFFEDCBA9876543210"
     data = (
@@ -588,7 +1019,62 @@ def test_extract_raw_images_from_clear_text_bitonal_tiles() -> None:
     assert len(images) == 1
     assert images[0].width == 2
     assert images[0].height == 2
+    assert images[0].local_color_precision == 16
+    assert images[0].cell_representation_mode == 0
     assert images[0].payload == bytes.fromhex(hex_payload)
+
+
+def test_extract_raw_images_from_clear_text_color_tiles() -> None:
+    hex_payload = "00112233445566778899AABBCCDDEEFF"
+    data = (
+        "BEGTILEARRAY 0 0 0 0 1 1 2 2 0 0 0 0 2 2; "
+        f"COLORTILE 2 16 0 1 '' {hex_payload}; "
+        "ENDTILEARRAY;"
+    ).encode("ascii")
+
+    images = extract_raw_images_from_bytes(data)
+
+    assert len(images) == 1
+    assert images[0].width == 2
+    assert images[0].height == 2
+    assert images[0].local_color_precision == 16
+    assert images[0].cell_representation_mode == 0
+    assert images[0].payload == bytes.fromhex(hex_payload)
+
+
+def test_extract_raw_images_from_clear_text_direct_color_tiles_default_precision() -> None:
+    hex_payload = "00112233445566778899AABBCCDDEEFF"
+    data = (
+        f"BEGTILEARRAY 0 0 0 0 1 1 2 2 0 0 0 0 2 2; DIRECTCOLORTILE '' {hex_payload}; ENDTILEARRAY;"
+    ).encode("ascii")
+
+    images = extract_raw_images_from_bytes(data)
+
+    assert len(images) == 1
+    assert images[0].width == 2
+    assert images[0].height == 2
+    assert images[0].local_color_precision == 24
+    assert images[0].cell_representation_mode == 0
+    assert images[0].payload == bytes.fromhex(hex_payload)
+
+
+def test_extract_vector_svg_from_bytes_renders_rgb_cell_array() -> None:
+    # 2x1 RGB payload: red pixel then green pixel.
+    rgb_payload = bytes([255, 0, 0, 0, 255, 0])
+    params = (
+        (b"\x00" * 12)
+        + (2).to_bytes(2, "big")
+        + (1).to_bytes(2, "big")
+        + (24).to_bytes(2, "big")
+        + (0).to_bytes(2, "big")
+        + rgb_payload
+    )
+    data = _header(4, 9, len(params)) + params
+
+    svg = extract_vector_svg_from_bytes(data)
+
+    assert "<svg" in svg
+    assert "<image" in svg
 
 
 def test_extract_rendered_images_to_directory_writes_svg(tmp_path: Path) -> None:
@@ -622,6 +1108,251 @@ def test_extract_rendered_images_to_directory_stitches_tile_arrays(tmp_path: Pat
     svg = svg_path.read_text(encoding="utf-8")
     assert "<svg" in svg
     assert "<image" in svg
+
+
+def test_extract_rendered_images_to_directory_stitches_color_tiles(tmp_path: Path) -> None:
+    src = tmp_path / "color_tiles.cgm"
+    # 2x2 RGBA tile (16 bytes => 32 hex chars).
+    hex_payload = "FF0000FF00FF00FF0000FFFFFFFFFFFF"
+    src.write_text(
+        "BEGTILEARRAY 0 0 0 0 1 1 2 2 0 0 0 0 2 2; "
+        f"COLORTILE 2 32 0 1 '' {hex_payload}; "
+        "ENDTILEARRAY;",
+        encoding="ascii",
+    )
+
+    written = extract_rendered_images_to_directory(src, tmp_path, stem="color_tiles")
+
+    svg_path = tmp_path / "color_tiles_0000.svg"
+    assert svg_path in written
+    svg = svg_path.read_text(encoding="utf-8")
+    assert "<svg" in svg
+    assert "<image" in svg
+
+
+def test_extract_vector_svg_from_bytes_supports_clear_text_color_tile_arrays() -> None:
+    tile_0 = "FF0000FF" * 8
+    tile_1 = "00FF00FF" * 8
+    data = (
+        "BEGTILEARRAY 0 0 0 0 2 1 4 2 0 0 0 0 8 2; "
+        f"COLORTILE 2 8 0 1 '' {tile_0}; "
+        f"COLORTILE 2 8 0 1 '' {tile_1}; "
+        "ENDTILEARRAY;"
+    ).encode("ascii")
+
+    svg = extract_vector_svg_from_bytes(data)
+
+    assert svg.count("<image") == 2
+    assert 'viewBox="0.000 0.000 8.000 2.000"' in svg
+
+
+def test_decode_tile_payload_to_image_supports_indexed_tiles() -> None:
+    image = extract_module._decode_tile_payload_to_image(
+        bytes([0, 1, 2, 3]),
+        2,
+        2,
+        family="indexed",
+    )
+
+    assert image is not None
+    assert image.mode == "P"
+    assert image.size == (2, 2)
+
+
+def test_render_raw_image_payload_uses_supplied_palette_colors() -> None:
+    raw = extract_module.RawImage(
+        index=0,
+        element_offset=0,
+        payload=bytes([0, 1]),
+        width=2,
+        height=1,
+        local_color_precision=8,
+        cell_representation_mode=0,
+    )
+    palette = bytearray(value for value in range(256) for _ in range(3))
+    palette[3:6] = bytes([255, 0, 0])
+
+    image = extract_module._render_raw_image_payload(raw, indexed_palette=bytes(palette))
+
+    assert image is not None
+    rgb = image.convert("RGB")
+    assert rgb.getpixel((0, 0)) == (0, 0, 0)
+    assert rgb.getpixel((1, 0)) == (255, 0, 0)
+
+
+def test_render_first_tile_array_uses_color_table_palette() -> None:
+    tile_payload = bytes([0, 1, 0, 1])
+    color_table = {1: (255, 0, 0)}
+    palette = extract_module._indexed_palette_bytes(color_table)
+
+    image = extract_module._decode_tile_payload_to_image(
+        tile_payload,
+        2,
+        2,
+        family="indexed",
+        indexed_palette=palette,
+    )
+
+    assert image is not None
+    rgb = image.convert("RGB")
+    assert rgb.getpixel((0, 0)) == (0, 0, 0)
+    assert rgb.getpixel((1, 0)) == (255, 0, 0)
+
+
+def test_decode_tile_payload_to_image_scales_16bit_direct_color_extent() -> None:
+    # One red pixel in 12-bit domain carried in 16-bit channels (max=4095).
+    payload = bytes.fromhex("0fff00000000")
+    image = extract_module._decode_tile_payload_to_image(
+        payload,
+        1,
+        1,
+        local_color_precision=16,
+        color_value_extent=(0, 0, 0, 4095, 4095, 4095),
+    )
+
+    assert image is not None
+    assert image.mode == "RGB"
+    assert image.getpixel((0, 0)) == (255, 0, 0)
+
+
+def test_render_raw_image_payload_scales_16bit_direct_color_extent() -> None:
+    raw = extract_module.RawImage(
+        index=0,
+        element_offset=0,
+        payload=bytes.fromhex("0fff0000000000000fff0000"),
+        width=2,
+        height=1,
+        local_color_precision=16,
+        cell_representation_mode=0,
+    )
+
+    image = extract_module._render_raw_image_payload(
+        raw,
+        color_value_extent=(0, 0, 0, 4095, 4095, 4095),
+    )
+
+    assert image is not None
+    assert image.mode == "RGB"
+    assert image.getpixel((0, 0)) == (255, 0, 0)
+    assert image.getpixel((1, 0)) == (0, 255, 0)
+
+
+def test_decode_tile_payload_to_image_scales_nonzero_16bit_extent_and_clamps() -> None:
+    # Extent is 1024..3072 for each channel.
+    # Pixel 0: (0,1024,3072) -> (0,0,255) after clamp/scale.
+    # Pixel 1: (3072,2048,65535) -> (255,128,255) after clamp/scale.
+    payload = bytes.fromhex("000004000c000c000800ffff")
+
+    image = extract_module._decode_tile_payload_to_image(
+        payload,
+        2,
+        1,
+        local_color_precision=16,
+        color_value_extent=(1024, 1024, 1024, 3072, 3072, 3072),
+    )
+
+    assert image is not None
+    assert image.mode == "RGB"
+    assert image.getpixel((0, 0)) == (0, 0, 255)
+    assert image.getpixel((1, 0)) == (255, 128, 255)
+
+
+def test_render_raw_image_payload_scales_nonzero_16bit_extent_and_clamps() -> None:
+    raw = extract_module.RawImage(
+        index=0,
+        element_offset=0,
+        payload=bytes.fromhex("000004000c000c000800ffff"),
+        width=2,
+        height=1,
+        local_color_precision=16,
+        cell_representation_mode=0,
+    )
+
+    image = extract_module._render_raw_image_payload(
+        raw,
+        color_value_extent=(1024, 1024, 1024, 3072, 3072, 3072),
+    )
+
+    assert image is not None
+    assert image.mode == "RGB"
+    assert image.getpixel((0, 0)) == (0, 0, 255)
+    assert image.getpixel((1, 0)) == (255, 128, 255)
+
+
+def test_extract_vector_svg_from_bytes_supports_clear_text_index_tile_arrays() -> None:
+    payload = "000102030405060708090A0B0C0D0E0F"
+    data = (
+        "BEGTILEARRAY 0 0 0 0 1 1 2 2 0 0 0 0 2 2; "
+        f"INDEXCOLORTILE 2 8 0 1 '' {payload}; "
+        "ENDTILEARRAY;"
+    ).encode("ascii")
+
+    svg = extract_vector_svg_from_bytes(data)
+
+    assert "<image" in svg
+    assert 'viewBox="0.000 0.000 2.000 2.000"' in svg
+
+
+def test_extract_vector_svg_from_bytes_supports_short_clear_text_index_tile_payload() -> None:
+    data = (
+        "BEGTILEARRAY 0 0 0 0 1 1 2 1 0 0 0 0 2 1; INDEXCOLORTILE 2 8 0 1 '' 0001; ENDTILEARRAY;"
+    ).encode("ascii")
+
+    svg = extract_vector_svg_from_bytes(data)
+
+    assert "<image" in svg
+    assert 'viewBox="0.000 0.000 2.000 1.000"' in svg
+
+
+def test_parse_text_tile_arrays_gr_77775_payloads_are_not_truncated() -> None:
+    from pathlib import Path  # noqa: PLC0415
+
+    root = Path(__file__).resolve().parents[1]
+    candidates = [
+        root / "sample" / "GR-77775.cgm",
+        root / "test_files" / "GR-77775.cgm",
+    ]
+    source = next((path for path in candidates if path.exists()), candidates[0])
+
+    arrays = extract_module._parse_text_tile_arrays(source.read_bytes())
+
+    assert len(arrays) == 1
+    tiles = arrays[0].get("tiles")
+    assert isinstance(tiles, list)
+    assert len(tiles) == 12
+    lengths = [len(tile.get("payload", b"")) for tile in tiles if isinstance(tile, dict)]
+    assert len(lengths) == 12
+    # Regression guard: truncated parser output previously produced tiny payloads (e.g. 19 bytes).
+    assert min(lengths) >= 200
+
+
+def test_extract_vector_svg_from_clear_text_scales_direct_color_tile_with_color_value_extent() -> (
+    None
+):
+    # Two pixels in 16-bit RGB channels with extent 1024..3072 for each channel:
+    # (0,1024,3072) -> (0,0,255), (3072,2048,65535) -> (255,128,255)
+    hex_payload = "000004000c000c000800ffff"
+    data = (
+        "COLRVALUEEXT 1024 1024 1024 3072 3072 3072; "
+        "BEGTILEARRAY 0 0 0 0 1 1 2 1 0 0 0 0 2 1; "
+        f"DIRECTCOLORTILE 2 16 0 1 '' {hex_payload}; "
+        "ENDTILEARRAY;"
+    ).encode("ascii")
+
+    svg = extract_vector_svg_from_bytes(data)
+
+    match = re.search(r'href="(data:image/png;base64,[^"]+)"', svg)
+    assert match is not None
+    href = match.group(1)
+    assert href.startswith("data:image/png;base64,")
+    encoded = href.split(",", 1)[1]
+    decoded = base64.b64decode(encoded)
+    image_module = importlib.import_module("PIL.Image")
+    image = image_module.open(io.BytesIO(decoded)).convert("RGB")
+
+    assert image.size == (2, 1)
+    assert image.getpixel((0, 0)) == (0, 0, 255)
+    assert image.getpixel((1, 0)) == (255, 128, 255)
 
 
 def test_extract_rendered_images_to_directory_writes_decode_report(tmp_path: Path) -> None:

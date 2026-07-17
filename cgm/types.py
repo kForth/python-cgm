@@ -29,6 +29,8 @@ class RawImage:
     payload: bytes
     width: int | None = None
     height: int | None = None
+    local_color_precision: int | None = None
+    cell_representation_mode: int | None = None
 
     def default_filename(self, *, stem: str = "image") -> str:
         """Return a deterministic filename for saving this payload."""
