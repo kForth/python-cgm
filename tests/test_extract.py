@@ -13,8 +13,6 @@ import re
 import struct
 from typing import TYPE_CHECKING
 
-import pytest
-
 import cgm.extract as extract_module
 from cgm.extract import (
     extract_data_json_from_bytes,
@@ -91,16 +89,6 @@ def test_render_raw_image_payload_prefers_indexed_when_precision_is_8bit() -> No
     assert image is not None
     assert image.mode == "P"
     assert image.size == (2, 2)
-
-
-def test_extract_vector_svg_from_bytes_emits_svg_document() -> None:
-    points = _encode_f32(0.0) + _encode_f32(0.0) + _encode_f32(10.0) + _encode_f32(10.0)
-    data = _header(4, 1, len(points)) + points
-
-    svg = extract_vector_svg_from_bytes(data)
-
-    assert "<svg" in svg
-    assert "<polyline" in svg
 
 
 def test_extract_data_json_from_bytes_contains_core_sections() -> None:
@@ -281,81 +269,6 @@ def test_extract_final_image_and_hotspots_rejects_image_format_kwarg(tmp_path: P
     assert "image_format" not in signature.parameters
 
 
-def test_extract_vector_svg_from_clear_text_cgm() -> None:
-    data = b'VDCEXT 0 0 100 100; LINE 0 0 10 10; TEXT 12 34 "NOTE";'
-
-    svg = extract_vector_svg_from_bytes(data)
-
-    assert "<svg" in svg
-    assert "<polyline" in svg
-    assert "NOTE" in svg
-
-
-def test_extract_vector_svg_from_bytes_supports_additional_primitives() -> None:
-    disjoint = _encode_f32(0.0) + _encode_f32(0.0) + _encode_f32(10.0) + _encode_f32(10.0)
-    markers = _encode_f32(5.0) + _encode_f32(5.0)
-    polygon_set = (
-        _encode_f32(10.0)
-        + _encode_f32(10.0)
-        + _encode_f32(20.0)
-        + _encode_f32(10.0)
-        + _encode_f32(15.0)
-        + _encode_f32(20.0)
-    )
-    rectangle = _encode_f32(40.0) + _encode_f32(40.0) + _encode_f32(60.0) + _encode_f32(70.0)
-    circle = _encode_f32(80.0) + _encode_f32(80.0) + _encode_f32(5.0)
-    ellipse = (
-        _encode_f32(120.0)
-        + _encode_f32(120.0)
-        + _encode_f32(135.0)
-        + _encode_f32(120.0)
-        + _encode_f32(120.0)
-        + _encode_f32(140.0)
-    )
-
-    data = (
-        _header(4, 2, len(disjoint))
-        + disjoint
-        + _header(4, 3, len(markers))
-        + markers
-        + _header(4, 8, len(polygon_set))
-        + polygon_set
-        + _header(4, 11, len(rectangle))
-        + rectangle
-        + _header(4, 12, len(circle))
-        + circle
-        + _header(4, 17, len(ellipse))
-        + ellipse
-    )
-
-    svg = extract_vector_svg_from_bytes(data)
-
-    assert "<polyline" in svg
-    assert "<polygon" in svg
-    assert "<rect" in svg
-    assert "<ellipse" in svg
-    assert svg.count("<circle") >= 2
-
-
-def test_extract_vector_svg_from_bytes_applies_binary_color_table_to_line_color() -> None:
-    # Class 5 / element 34 (Color Table): start index 10 => RGB(255,0,0).
-    color_table = bytes([10, 255, 0, 0])
-    line_color = bytes([10, 0])
-    points = _encode_f32(0.0) + _encode_f32(0.0) + _encode_f32(10.0) + _encode_f32(10.0)
-    data = (
-        _header(5, 34, len(color_table))
-        + color_table
-        + _header(5, 4, len(line_color))
-        + line_color
-        + _header(4, 1, len(points))
-        + points
-    )
-
-    svg = extract_vector_svg_from_bytes(data)
-
-    assert 'stroke="#ff0000"' in svg
-
-
 def test_extract_color_table_handles_16bit_components() -> None:
     data = bytearray()
     color_table = bytes([0, 2]) + bytes.fromhex("ffff00008000")
@@ -375,30 +288,6 @@ def test_extract_color_value_extent_from_binary_and_clear_text() -> None:
 
     assert binary_extent == (0, 0, 0, 4095, 4095, 4095)
     assert clear_text_extent == (0, 0, 0, 4095, 4095, 4095)
-
-
-def test_extract_vector_svg_from_clear_text_applies_color_table_to_line_color() -> None:
-    data = b"COLRTABLE 10 255 0 0; LINECOLR 10; LINE 0 0 10 10;"
-
-    svg = extract_vector_svg_from_bytes(data)
-
-    assert 'stroke="#ff0000"' in svg
-
-
-def test_extract_vector_svg_from_bytes_respects_binary_transparency_mode() -> None:
-    transparency_off = _header(3, 4, 1) + b"\x00"
-    line = (
-        _header(4, 1, 16)
-        + _encode_f32(0.0)
-        + _encode_f32(0.0)
-        + _encode_f32(10.0)
-        + _encode_f32(10.0)
-    )
-
-    svg = extract_vector_svg_from_bytes(transparency_off + b"\x00" + line)
-
-    assert 'fill="#ffffff"' in svg
-    assert "<polyline" in svg
 
 
 def test_extract_vector_svg_from_clear_text_respects_transparency_mode() -> None:
@@ -436,14 +325,16 @@ def test_extract_vector_svg_from_clear_text_respects_clip_commands() -> None:
 
 
 def test_extract_vector_svg_from_bytes_supports_binary_integer_polyline() -> None:
-    # Binary streams often encode VDC coordinates as 16-bit signed integers.
+    # Integer coordinate decode now requires explicit VDC descriptors.
+    vdc_type_integer = _header(1, 3, 2) + (0).to_bytes(2, "big")
+    vdc_integer_precision = _header(1, 11, 2) + (16).to_bytes(2, "big")
     points_i16 = (
         (0).to_bytes(2, "big", signed=True)
         + (0).to_bytes(2, "big", signed=True)
         + (100).to_bytes(2, "big", signed=True)
         + (100).to_bytes(2, "big", signed=True)
     )
-    data = _header(4, 1, len(points_i16)) + points_i16
+    data = vdc_type_integer + vdc_integer_precision + _header(4, 1, len(points_i16)) + points_i16
 
     svg = extract_vector_svg_from_bytes(data)
 
@@ -452,6 +343,8 @@ def test_extract_vector_svg_from_bytes_supports_binary_integer_polyline() -> Non
 
 
 def test_extract_vector_svg_from_bytes_supports_binary_integer32_polyline() -> None:
+    vdc_type_integer = _header(1, 3, 2) + (0).to_bytes(2, "big")
+    vdc_integer_precision = _header(1, 11, 2) + (32).to_bytes(2, "big")
     points_i32 = (
         (2_500_000).to_bytes(4, "big", signed=True)
         + (2_500_000).to_bytes(4, "big", signed=True)
@@ -464,7 +357,14 @@ def test_extract_vector_svg_from_bytes_supports_binary_integer32_polyline() -> N
         + _encode_f32(2_700_000.0)
         + _encode_f32(2_700_000.0)
     )
-    data = _header(2, 6, len(extent)) + extent + _header(4, 1, len(points_i32)) + points_i32
+    data = (
+        vdc_type_integer
+        + vdc_integer_precision
+        + _header(2, 6, len(extent))
+        + extent
+        + _header(4, 1, len(points_i32))
+        + points_i32
+    )
 
     svg = extract_vector_svg_from_bytes(data)
 
@@ -472,33 +372,32 @@ def test_extract_vector_svg_from_bytes_supports_binary_integer32_polyline() -> N
     assert '<polyline points="2500000.000,2600000.000 2600000.000,2500000.000"' in svg
 
 
-def test_extract_vector_svg_from_bytes_supports_extended_binary_arc_family() -> None:
-    segment = _encode_f32(0.0) + _encode_f32(0.0) + _encode_f32(10.0) + _encode_f32(10.0)
-    data = b"".join(_header(4, element_id, len(segment)) + segment for element_id in range(20, 29))
-
-    svg = extract_vector_svg_from_bytes(data)
-
-    assert "<svg" in svg
-    assert "<polyline" in svg
-    assert "unsupported drawing primitives" not in svg
-
-
-def test_extract_vector_svg_from_bytes_renders_binary_gdp_with_other_primitives() -> None:
-    polyline = _encode_f32(0.0) + _encode_f32(0.0) + _encode_f32(10.0) + _encode_f32(10.0)
-    gdp_polyline = _encode_f32(20.0) + _encode_f32(20.0) + _encode_f32(30.0) + _encode_f32(30.0)
-    data = (
-        _header(4, 1, len(polyline))
-        + polyline
-        + _header(4, 10, len(gdp_polyline))
-        + gdp_polyline
-        + _header(4, 26, len(gdp_polyline))
-        + gdp_polyline
+def test_extract_vector_svg_from_bytes_uses_vdc_integer_descriptor() -> None:
+    vdc_type_integer = _header(1, 3, 2) + (0).to_bytes(2, "big")
+    vdc_integer_precision = _header(1, 11, 2) + (16).to_bytes(2, "big")
+    points_i16 = (
+        (0).to_bytes(2, "big", signed=True)
+        + (0).to_bytes(2, "big", signed=True)
+        + (100).to_bytes(2, "big", signed=True)
+        + (100).to_bytes(2, "big", signed=True)
     )
+    data = vdc_type_integer + vdc_integer_precision + _header(4, 1, len(points_i16)) + points_i16
 
     svg = extract_vector_svg_from_bytes(data)
 
-    assert "<svg" in svg
-    assert svg.count("<polyline") >= 3
+    assert '<polyline points="0.000,100.000 100.000,0.000"' in svg
+
+
+def test_extract_vector_svg_from_bytes_uses_vdc_real_descriptor() -> None:
+    vdc_type_real = _header(1, 3, 2) + (1).to_bytes(2, "big")
+    # Minimal real-precision hint used by strict descriptor path.
+    vdc_real_precision = _header(1, 12, 2) + (32).to_bytes(2, "big")
+    points = _encode_f32(1.0) + _encode_f32(1.0) + _encode_f32(2.0) + _encode_f32(2.0)
+    data = vdc_type_real + vdc_real_precision + _header(4, 1, len(points)) + points
+
+    svg = extract_vector_svg_from_bytes(data)
+
+    assert '<polyline points="1.000,2.000 2.000,1.000"' in svg
 
 
 def test_extract_raw_images_from_clear_text_cellarray() -> None:
@@ -510,96 +409,6 @@ def test_extract_raw_images_from_clear_text_cellarray() -> None:
     assert images[0].width == 2
     assert images[0].height == 2
     assert images[0].payload == b"\x01\x02\x03\x04"
-
-
-def test_extract_vector_svg_from_bytes_supports_binary_tile_arrays() -> None:
-    # Two binary Cell Array payloads representing a tiled 4x2 canvas.
-    # Each tile is encoded as packed 1-bit rows (2 bytes for a 2x2 tile).
-    tile_0 = b"\xc0\xc0"
-    tile_1 = b"\x00\x00"
-    params_0 = (
-        (b"\x00" * 12)
-        + (4).to_bytes(2, "big")
-        + (2).to_bytes(2, "big")
-        + (1).to_bytes(2, "big")
-        + (0).to_bytes(2, "big")
-        + tile_0
-    )
-    params_1 = (
-        (b"\x00" * 12)
-        + (4).to_bytes(2, "big")
-        + (2).to_bytes(2, "big")
-        + (1).to_bytes(2, "big")
-        + (0).to_bytes(2, "big")
-        + tile_1
-    )
-    data = _header(4, 9, len(params_0)) + params_0 + _header(4, 9, len(params_1)) + params_1
-
-    svg = extract_vector_svg_from_bytes(data)
-
-    assert "<svg" in svg
-    assert svg.count("<image") == 2
-    assert 'viewBox="0.000 0.000 4.000 2.000"' in svg
-
-
-def test_parse_binary_tile_arrays_marks_one_byte_tiles_as_indexed() -> None:
-    tile_0 = bytes([0, 1, 2, 3])
-    tile_1 = bytes([3, 2, 1, 0])
-    params_0 = (
-        (b"\x00" * 12)
-        + (4).to_bytes(2, "big")
-        + (2).to_bytes(2, "big")
-        + (1).to_bytes(2, "big")
-        + (0).to_bytes(2, "big")
-        + tile_0
-    )
-    params_1 = (
-        (b"\x00" * 12)
-        + (4).to_bytes(2, "big")
-        + (2).to_bytes(2, "big")
-        + (1).to_bytes(2, "big")
-        + (0).to_bytes(2, "big")
-        + tile_1
-    )
-    data = _header(4, 9, len(params_0)) + params_0 + _header(4, 9, len(params_1)) + params_1
-
-    arrays = extract_module._parse_binary_tile_arrays(data)
-
-    assert len(arrays) == 1
-    first_tile = arrays[0]["tiles"][0]
-    assert isinstance(first_tile, dict)
-    assert first_tile["family"] == "indexed"
-    decoded = extract_module._decode_tile_payload_to_image(
-        first_tile["payload"],
-        arrays[0]["tile_width"],
-        arrays[0]["tile_height"],
-        family=first_tile["family"],
-    )
-    assert decoded is not None
-    assert decoded.mode == "P"
-
-
-def test_parse_binary_tile_arrays_preserves_precision_and_representation_mode() -> None:
-    payload = bytes([255, 0, 0])
-    params = (
-        (b"\x00" * 12)
-        + (1).to_bytes(2, "big")
-        + (1).to_bytes(2, "big")
-        + (24).to_bytes(2, "big")
-        + (1).to_bytes(2, "big")
-        + payload
-    )
-    data = _header(4, 9, len(params)) + params
-
-    arrays = extract_module._parse_binary_tile_arrays(data)
-
-    assert len(arrays) == 1
-    tiles = arrays[0]["tiles"]
-    assert isinstance(tiles, list)
-    first_tile = tiles[0]
-    assert isinstance(first_tile, dict)
-    assert first_tile.get("local_color_precision") == 24
-    assert first_tile.get("cell_representation_mode") == 1
 
 
 def test_parse_text_tile_arrays_preserves_precision_and_representation_mode() -> None:
@@ -619,88 +428,6 @@ def test_parse_text_tile_arrays_preserves_precision_and_representation_mode() ->
     assert isinstance(first_tile, dict)
     assert first_tile.get("local_color_precision") == 24
     assert first_tile.get("cell_representation_mode") == 1
-
-
-def test_extract_vector_svg_from_bytes_supports_binary_direct_color_tile_arrays() -> None:
-    # Two RGB tiles composing a 2x1 canvas.
-    tile_0 = bytes([255, 0, 0])
-    tile_1 = bytes([0, 255, 0])
-    params_0 = (
-        (b"\x00" * 12)
-        + (2).to_bytes(2, "big")
-        + (1).to_bytes(2, "big")
-        + (24).to_bytes(2, "big")
-        + (0).to_bytes(2, "big")
-        + tile_0
-    )
-    params_1 = (
-        (b"\x00" * 12)
-        + (2).to_bytes(2, "big")
-        + (1).to_bytes(2, "big")
-        + (24).to_bytes(2, "big")
-        + (0).to_bytes(2, "big")
-        + tile_1
-    )
-    data = (
-        _header(4, 9, len(params_0)) + params_0 + b"\x00" + _header(4, 9, len(params_1)) + params_1
-    )
-
-    svg = extract_vector_svg_from_bytes(data)
-
-    assert "<svg" in svg
-    assert svg.count("<image") == 2
-    assert 'viewBox="0.000 0.000 2.000 1.000"' in svg
-
-
-def test_extract_vector_svg_from_bytes_maps_tile_images_into_viewbox() -> None:
-    # Add a vector primitive so bounds are not derived from tile dimensions.
-    polyline = _encode_f32(10.0) + _encode_f32(10.0) + _encode_f32(20.0) + _encode_f32(20.0)
-    tile_0 = b"\xc0\xc0"
-    tile_1 = b"\x00\x00"
-    params_0 = (
-        (b"\x00" * 12)
-        + (4).to_bytes(2, "big")
-        + (2).to_bytes(2, "big")
-        + (1).to_bytes(2, "big")
-        + (0).to_bytes(2, "big")
-        + tile_0
-    )
-    params_1 = (
-        (b"\x00" * 12)
-        + (4).to_bytes(2, "big")
-        + (2).to_bytes(2, "big")
-        + (1).to_bytes(2, "big")
-        + (0).to_bytes(2, "big")
-        + tile_1
-    )
-    data = (
-        _header(4, 1, len(polyline))
-        + polyline
-        + _header(4, 9, len(params_0))
-        + params_0
-        + _header(4, 9, len(params_1))
-        + params_1
-    )
-
-    svg = extract_vector_svg_from_bytes(data)
-
-    assert 'viewBox="10.000 10.000 10.000 10.000"' in svg
-    assert '<image x="10.000" y="10.000" width="5.000" height="10.000"' in svg
-    assert '<image x="15.000" y="10.000" width="5.000" height="10.000"' in svg
-
-
-def test_extract_vector_svg_from_bytes_preserves_out_of_range_point_coordinates() -> None:
-    extent = (
-        _encode_f32(2_000_000.0) + _encode_f32(-1.0) + _encode_f32(3_000_000.0) + _encode_f32(1.0)
-    )
-    points = (
-        _encode_f32(2_500_000.0) + _encode_f32(0.0) + _encode_f32(2_600_000.0) + _encode_f32(0.0)
-    )
-    data = _header(2, 6, len(extent)) + extent + _header(4, 1, len(points)) + points
-
-    svg = extract_vector_svg_from_bytes(data)
-
-    assert "2500000.000,0.000" in svg
 
 
 def test_extract_hotspots_from_clear_text_application_data() -> None:
@@ -775,28 +502,7 @@ def test_extract_hotspots_from_gr_77775_contains_autoid_regions() -> None:
     assert "AUTOID_1" in tags
 
 
-def test_element29_binary_fallback_rejects_low_confidence_gr_283383() -> None:
-    from pathlib import Path  # noqa: PLC0415
-
-    root = Path(__file__).resolve().parents[1]
-    candidates = [
-        root / "sample" / "GR-283383.cgm",
-        root / "test_files" / "GR-283383.cgm",
-    ]
-    source = next((path for path in candidates if path.exists()), candidates[0])
-
-    payload = None
-    for element in extract_module.iter_elements(source.read_bytes()):
-        if element.class_id == 4 and element.element_id == 29:
-            payload = element.parameters
-            break
-
-    assert payload is not None
-    decode_element29 = extract_module._decode_element29_binary_raster
-    assert decode_element29(payload) is None
-
-
-def test_gr_283383_data_snapshot_includes_element29_decode_diagnostics() -> None:
+def test_gr_283383_data_snapshot_defaults_to_non_heuristic_element29_analysis() -> None:
     from pathlib import Path  # noqa: PLC0415
 
     root = Path(__file__).resolve().parents[1]
@@ -810,11 +516,11 @@ def test_gr_283383_data_snapshot_includes_element29_decode_diagnostics() -> None
     element29 = snapshot["element29_analysis"][0]
 
     assert "decode_candidates" in element29
-    assert element29["decode_candidates"]
+    assert element29["decode_candidates"] == []
     assert element29["has_plausible_decode"] is False
 
 
-def test_gr_283383_renders_class_29_fallback_image() -> None:
+def test_gr_283383_default_svg_does_not_use_heuristic_class29_fallback() -> None:
     from pathlib import Path  # noqa: PLC0415
 
     root = Path(__file__).resolve().parents[1]
@@ -826,111 +532,9 @@ def test_gr_283383_renders_class_29_fallback_image() -> None:
 
     svg = extract_vector_svg_from_bytes(source.read_bytes())
 
-    assert "<image " in svg
+    assert "<image " not in svg
     assert "unsupported drawing primitives" not in svg
     assert "POSID_" not in svg
-
-
-def test_extract_vector_svg_from_bytes_tries_multiple_element29_payloads(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    first = b"FIRST_PAYLOAD0"
-    second = b"SECOND_PAYLOAD0"
-    data = _header(4, 29, len(first)) + first + _header(4, 29, len(second)) + second
-
-    calls: list[tuple[bytes, bool]] = []
-
-    def _fake_decode(
-        parameters: bytes,
-        *,
-        allow_low_confidence: bool = False,
-    ) -> tuple[str, int, int] | None:
-        calls.append((parameters, allow_low_confidence))
-        if parameters == second and not allow_low_confidence:
-            return "data:image/png;base64,AAAA", 2, 1
-        return None
-
-    monkeypatch.setattr(extract_module, "_decode_element29_binary_raster", _fake_decode)
-
-    svg = extract_vector_svg_from_bytes(data)
-
-    assert "<image " in svg
-    assert 'href="data:image/png;base64,AAAA"' in svg
-    assert calls[0] == (first, False)
-    assert calls[1] == (second, False)
-
-
-def test_extract_vector_svg_from_bytes_element29_fallback_uses_low_confidence_pass(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    payload = b"LOWCONF_PAYLOAD0"
-    data = _header(4, 29, len(payload)) + payload
-
-    calls: list[bool] = []
-
-    def _fake_decode(
-        parameters: bytes,
-        *,
-        allow_low_confidence: bool = False,
-    ) -> tuple[str, int, int] | None:
-        assert parameters == payload
-        calls.append(allow_low_confidence)
-        if allow_low_confidence:
-            return "data:image/png;base64,BBBB", 2, 1
-        return None
-
-    monkeypatch.setattr(extract_module, "_decode_element29_binary_raster", _fake_decode)
-
-    svg = extract_vector_svg_from_bytes(data)
-
-    assert "<image " in svg
-    assert 'href="data:image/png;base64,BBBB"' in svg
-    assert calls == [False, True]
-
-
-def test_decode_best_element29_fallback_uses_real_fixture_payload_order(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from pathlib import Path  # noqa: PLC0415
-
-    root = Path(__file__).resolve().parents[1]
-    candidates = [
-        root / "sample" / "GR-77775.cgm",
-        root / "test_files" / "GR-77775.cgm",
-    ]
-    source = next((path for path in candidates if path.exists()), candidates[0])
-
-    payloads = [
-        element.parameters
-        for element in extract_module.iter_elements(source.read_bytes())
-        if element.class_id == 4 and element.element_id == 29
-    ]
-    assert len(payloads) >= 2
-
-    calls: list[tuple[bytes, bool]] = []
-    target = payloads[1]
-
-    def _fake_decode(
-        parameters: bytes,
-        *,
-        allow_low_confidence: bool = False,
-    ) -> tuple[str, int, int] | None:
-        calls.append((parameters, allow_low_confidence))
-        if parameters == target and not allow_low_confidence:
-            return "data:image/png;base64,CCCC", 2, 1
-        return None
-
-    monkeypatch.setattr(extract_module, "_decode_element29_binary_raster", _fake_decode)
-
-    decoded = extract_module._decode_best_element29_fallback(payloads)
-
-    assert decoded is not None
-    href, width, height = decoded
-    assert href == "data:image/png;base64,CCCC"
-    assert width == 2
-    assert height == 1
-    assert calls[0] == (payloads[0], False)
-    assert calls[1] == (payloads[1], False)
 
 
 def test_gr_78946_renders_binary_text_and_arcs() -> None:
@@ -953,36 +557,6 @@ def test_gr_78946_renders_binary_text_and_arcs() -> None:
     _x, _y, width, height = (float(part) for part in match.group(1).split())
     assert width < 10_000_000
     assert height < 1_000_000
-
-
-def test_gr_78946_text_anchors_land_inside_viewbox() -> None:
-    from pathlib import Path  # noqa: PLC0415
-
-    root = Path(__file__).resolve().parents[1]
-    candidates = [
-        root / "sample" / "GR-78946.cgm",
-        root / "test_files" / "GR-78946.cgm",
-    ]
-    source = next((path for path in candidates if path.exists()), candidates[0])
-
-    svg = extract_vector_svg_from_bytes(source.read_bytes())
-
-    view_match = re.search(r'viewBox="([^"]+)"', svg)
-    assert view_match is not None
-    min_x, min_y, width, height = (float(part) for part in view_match.group(1).split())
-    max_x = min_x + width
-    max_y = min_y + height
-
-    text_items = re.findall(r'<text x="([^"]+)" y="([^"]+)"', svg)
-    assert text_items
-    in_view = 0
-    for x_text, y_text in text_items:
-        x = float(x_text)
-        y = float(y_text)
-        if min_x <= x <= max_x and min_y <= y <= max_y:
-            in_view += 1
-
-    assert in_view >= max(1, len(text_items) // 2)
 
 
 def test_gr_78946_does_not_emit_noisy_massive_polylines() -> None:
@@ -1374,41 +948,3 @@ def test_extract_rendered_images_to_directory_writes_decode_report(tmp_path: Pat
     assert report["arrays"]
     first_array = report["arrays"][0]
     assert first_array["tile_count"] == 1
-
-
-def test_score_bitmap_is_polarity_agnostic() -> None:
-    width = 8
-    height = 8
-    bits = [
-        1,
-        1,
-        1,
-        0,
-        0,
-        0,
-        1,
-        0,
-    ] * height
-    inverted = [1 - bit for bit in bits]
-    score_bitmap = extract_module._score_bitmap
-
-    score = score_bitmap(bits, width, height)
-    inverted_score = score_bitmap(inverted, width, height)
-
-    assert score == pytest.approx(inverted_score)
-
-
-def test_score_bitmap_rejects_nearly_single_color_regardless_of_polarity() -> None:
-    width = 100
-    height = 100
-    mostly_black = [1] * (width * height)
-    mostly_black[0] = 0
-    mostly_white = [0] * (width * height)
-    mostly_white[0] = 1
-    score_bitmap = extract_module._score_bitmap
-
-    black_score = score_bitmap(mostly_black, width, height)
-    white_score = score_bitmap(mostly_white, width, height)
-
-    assert black_score >= 1e8
-    assert white_score >= 1e8

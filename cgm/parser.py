@@ -355,7 +355,7 @@ def _extract_hex_payload(statement: str) -> bytes:
 
 
 def _derive_tile_dimensions(numbers: list[float]) -> tuple[int | None, int | None]:
-    """Best-effort extraction of tile dimensions from BEGTILEARRAY parameters."""
+    """Extract tile dimensions from BEGTILEARRAY parameters when they are present."""
     ints = [round(value) for value in numbers]
     if len(ints) >= 14 and ints[-2] > 0 and ints[-1] > 0:
         return ints[-2], ints[-1]
@@ -593,7 +593,8 @@ def _iter_text_elements(data: bytes) -> Iterator[CGMElement]:
             if not payload:
                 continue
             width, height = tile_dims
-            numbers = _extract_numbers(_HEX_RUN_RE.sub(" ", normalized_statement))
+            metadata_prefix = normalized_statement.split("''", 1)[0].split('""', 1)[0]
+            numbers = _extract_numbers(metadata_prefix)
             local_color_precision = (
                 round(numbers[1])
                 if len(numbers) >= 2

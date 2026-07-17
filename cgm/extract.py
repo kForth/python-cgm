@@ -1,4 +1,4 @@
-"""High-level CGM extraction helpers for SVG composition and hotspot recovery."""
+"""High-level CGM extraction helpers for SVG, tile/raster decoding, and hotspot recovery."""
 
 from __future__ import annotations
 
@@ -43,15 +43,6 @@ def _reverse_bits_in_byte(value: int) -> int:
     value = ((value & 0xCC) >> 2) | ((value & 0x33) << 2)
     value = ((value & 0xAA) >> 1) | ((value & 0x55) << 1)
     return value
-
-
-def _payload_variants(payload: bytes) -> list[bytes]:
-    """Return unique encoded payload variants used for decode attempts."""
-    variants = [payload]
-    reversed_bits = bytes(_reverse_bits_in_byte(byte) for byte in payload)
-    if reversed_bits != payload:
-        variants.append(reversed_bits)
-    return variants
 
 
 def _candidate_signature(candidate: dict[str, object] | None) -> tuple[str, str, bool] | None:
@@ -113,7 +104,7 @@ def _choose_consensus_decode_dimensions(
 
 
 def _parse_cell_array_hints(parameters: bytes) -> tuple[int | None, int | None, int]:
-    """Best-effort parse of common Cell Array metadata for binary CGM streams.
+    """Parse common Cell Array metadata for binary CGM streams when the layout matches.
 
     Many CGM files use 16-bit integer VDC coordinates and 16-bit dimensions.
     When this layout is present, this function returns width/height and payload
@@ -177,10 +168,70 @@ class _SvgStyle:
     marker_size: float = 2.0
 
 
+@dataclass(slots=True)
+class _CgmDescriptorProfile:
+    vdc_type: int | None = None
+    vdc_integer_precision: int | None = None
+    vdc_real_precision_bits: int | None = None
+
+
+def _extract_descriptor_profile(data: bytes) -> _CgmDescriptorProfile:
+    """Extract a minimal CGM descriptor profile used for strict coordinate decode."""
+
+    profile = _CgmDescriptorProfile()
+    for element in iter_elements(data):
+        if element.class_id != 1:
+            continue
+
+        if element.element_id == 3:
+            # VDC type: INTEGER=0, REAL=1 in common profiles.
+            if len(element.parameters) >= 2:
+                profile.vdc_type = int.from_bytes(element.parameters[:2], "big", signed=False)
+            elif element.parameters:
+                profile.vdc_type = int(element.parameters[0])
+            continue
+
+        if element.element_id == 11:
+            # VDC integer precision in bits.
+            if len(element.parameters) >= 2:
+                profile.vdc_integer_precision = int.from_bytes(
+                    element.parameters[:2],
+                    "big",
+                    signed=False,
+                )
+            continue
+
+        if element.element_id == 12:
+            # VDC real precision descriptors vary by profile; keep a compact
+            # hint for common IEEE-like 32/64-bit paths.
+            if len(element.parameters) >= 2:
+                head = int.from_bytes(element.parameters[:2], "big", signed=False)
+                if head in (32, 64):
+                    profile.vdc_real_precision_bits = head
+                elif len(element.parameters) >= 6:
+                    mantissa_bits = int.from_bytes(element.parameters[4:6], "big", signed=False)
+                    if mantissa_bits >= 52:
+                        profile.vdc_real_precision_bits = 64
+                    elif mantissa_bits >= 23:
+                        profile.vdc_real_precision_bits = 32
+            continue
+
+    return profile
+
+
 def _parse_f32_be(value: bytes) -> float | None:
     if len(value) != 4:
         return None
     parsed = float(struct.unpack(">f", value)[0])
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _parse_f64_be(value: bytes) -> float | None:
+    if len(value) != 8:
+        return None
+    parsed = float(struct.unpack(">d", value)[0])
     if not math.isfinite(parsed):
         return None
     return parsed
@@ -204,21 +255,6 @@ def _decode_point_pairs_i32(parameters: bytes) -> list[tuple[float, float]]:
         y = int.from_bytes(parameters[offset + 4 : offset + 8], "big", signed=True)
         points.append((float(x), float(y)))
     return points
-
-
-def _decode_point_pairs_heuristic(parameters: bytes) -> list[tuple[float, float]]:
-    best: list[tuple[float, float]] = []
-    for start in range(8):
-        points: list[tuple[float, float]] = []
-        for offset in range(start, len(parameters) - 7, 8):
-            x = _parse_f32_be(parameters[offset : offset + 4])
-            y = _parse_f32_be(parameters[offset + 4 : offset + 8])
-            if x is None or y is None:
-                continue
-            points.append((x, y))
-        if len(points) > len(best):
-            best = points
-    return best
 
 
 def _decode_cgm_text(parameters: bytes) -> str | None:
@@ -283,7 +319,7 @@ def _decode_application_property(parameters: bytes) -> tuple[str, bytes] | None:
 
 
 def _decode_hotspot_region_bbox(value: bytes) -> tuple[int, int, int, int] | None:
-    """Extract a best-effort rectangular region from hotspot payload bytes."""
+    """Extract a rectangular region from hotspot payload bytes when one is present."""
     if len(value) < 8:
         return None
     x_min = int.from_bytes(value[-8:-6], "big", signed=False)
@@ -296,7 +332,7 @@ def _decode_hotspot_region_bbox(value: bytes) -> tuple[int, int, int, int] | Non
 
 
 def extract_hotspots_from_bytes(data: bytes) -> list[HotSpot]:
-    """Extract best-effort hotspot regions from application data elements."""
+    """Extract hotspot regions from APD application data and APS geometry elements."""
     hotspots: list[HotSpot] = []
 
     context_stack: list[dict[str, object]] = []
@@ -462,7 +498,8 @@ def extract_final_image_and_hotspots(
 ) -> dict[str, object]:
     """Return the final image as SVG text and hotspot dictionaries.
 
-    The returned SVG may contain an embedded PNG image when raster fallback is used.
+    The returned SVG may contain an embedded raster background when tile or Cell Array
+    data is available.
     """
 
     path = Path(file_path)
@@ -666,8 +703,6 @@ def _indexed_palette_bytes(color_table: dict[int, tuple[int, int, int]]) -> byte
 def _format_points(
     points: list[tuple[float, float]],
     *,
-    min_x: float,
-    max_x: float,
     min_y: float,
     max_y: float,
 ) -> str:
@@ -830,18 +865,40 @@ def _decode_point_pairs_i16(parameters: bytes) -> list[tuple[float, float]]:
     return points
 
 
-def _coordinate_candidate_penalty(
-    points: list[tuple[float, float]],
+def _decode_point_pairs_f64(parameters: bytes) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for offset in range(0, len(parameters) - 15, 16):
+        x = _parse_f64_be(parameters[offset : offset + 8])
+        y = _parse_f64_be(parameters[offset + 8 : offset + 16])
+        if x is None or y is None:
+            continue
+        points.append((x, y))
+    return points
+
+
+def _decode_point_pairs_from_profile(
+    parameters: bytes,
     *,
-    vdc_extent: tuple[float, float, float, float] | None,
-) -> float:
-    penalty = _point_penalty(points, vdc_extent=vdc_extent)
-    for x, y in points:
-        if 0.0 < abs(x) < 1e-20:
-            penalty += 10.0
-        if 0.0 < abs(y) < 1e-20:
-            penalty += 10.0
-    return penalty
+    profile: _CgmDescriptorProfile,
+) -> list[tuple[float, float]]:
+    """Decode points using declared CGM descriptor values when available."""
+
+    if profile.vdc_type == 0:
+        precision = profile.vdc_integer_precision
+        if precision is not None and precision <= 16:
+            return _decode_point_pairs_i16(parameters)
+        if precision is not None and precision > 16:
+            return _decode_point_pairs_i32(parameters)
+        # Integer VDC without precision descriptor defaults to a common 16-bit layout.
+        return _decode_point_pairs_i16(parameters)
+
+    if profile.vdc_type == 1:
+        if profile.vdc_real_precision_bits == 64:
+            return _decode_point_pairs_f64(parameters)
+        return _decode_point_pairs_exact(parameters)
+
+    # Unknown VDC descriptor profile: do not guess mixed encodings.
+    return []
 
 
 def _point_penalty(
@@ -881,26 +938,6 @@ def _point_penalty(
     return penalty
 
 
-def _decode_point_pairs_best(
-    parameters: bytes,
-    *,
-    vdc_extent: tuple[float, float, float, float] | None,
-) -> list[tuple[float, float]]:
-    float_points = _decode_point_pairs_exact(parameters)
-    i32_points = _decode_point_pairs_i32(parameters)
-    i16_points = _decode_point_pairs_i16(parameters)
-
-    candidates = [candidate for candidate in (float_points, i32_points, i16_points) if candidate]
-    if not candidates:
-        return []
-
-    best = min(
-        candidates,
-        key=lambda pts: (_coordinate_candidate_penalty(pts, vdc_extent=vdc_extent), -len(pts)),
-    )
-    return best
-
-
 def _decode_vdc_extent(parameters: bytes) -> tuple[float, float, float, float] | None:
     if len(parameters) >= 16:
         real_values: list[float] = []
@@ -936,44 +973,47 @@ def _decode_vdc_extent(parameters: bytes) -> tuple[float, float, float, float] |
 def _decode_xy(
     parameters: bytes,
     *,
-    vdc_extent: tuple[float, float, float, float] | None,
+    profile: _CgmDescriptorProfile,
 ) -> tuple[float, float] | None:
-    candidates: list[tuple[float, float]] = []
-    for offset in (0, 4):
-        if len(parameters) < offset + 8:
-            continue
-        x_f32 = _parse_f32_be(parameters[offset : offset + 4])
-        y_f32 = _parse_f32_be(parameters[offset + 4 : offset + 8])
-        if x_f32 is not None and y_f32 is not None:
-            candidates.append((x_f32, y_f32))
+    if profile.vdc_type == 0:
+        if profile.vdc_integer_precision is not None and profile.vdc_integer_precision <= 16:
+            if len(parameters) >= 4:
+                x = _decode_i16_be(parameters[:2])
+                y = _decode_i16_be(parameters[2:4])
+                if x is not None and y is not None:
+                    return float(x), float(y)
+            return None
+        if len(parameters) >= 8:
+            x = _decode_i32_be(parameters[:4])
+            y = _decode_i32_be(parameters[4:8])
+            if x is not None and y is not None:
+                return float(x), float(y)
+        return None
 
-        x_i32 = _decode_i32_be(parameters[offset : offset + 4])
-        y_i32 = _decode_i32_be(parameters[offset + 4 : offset + 8])
-        if x_i32 is not None and y_i32 is not None:
-            candidates.append((float(x_i32), float(y_i32)))
+    if profile.vdc_type == 1:
+        if profile.vdc_real_precision_bits == 64:
+            if len(parameters) >= 16:
+                x_f64 = _parse_f64_be(parameters[:8])
+                y_f64 = _parse_f64_be(parameters[8:16])
+                if x_f64 is not None and y_f64 is not None:
+                    return x_f64, y_f64
+            return None
+        if len(parameters) >= 8:
+            x_f32 = _parse_f32_be(parameters[:4])
+            y_f32 = _parse_f32_be(parameters[4:8])
+            if x_f32 is not None and y_f32 is not None:
+                return x_f32, y_f32
+        return None
 
-    for offset in (0, 2, 4, 6):
-        if len(parameters) < offset + 4:
-            continue
-        x_i16 = _decode_i16_be(parameters[offset : offset + 2])
-        y_i16 = _decode_i16_be(parameters[offset + 2 : offset + 4])
-        if x_i16 is not None and y_i16 is not None:
-            candidates.append((float(x_i16), float(y_i16)))
-
-    if candidates:
-        return min(
-            candidates,
-            key=lambda pts: _coordinate_candidate_penalty([pts], vdc_extent=vdc_extent),
-        )
     return None
 
 
 def _decode_pairwise_segments(
     parameters: bytes,
     *,
-    vdc_extent: tuple[float, float, float, float] | None,
+    profile: _CgmDescriptorProfile,
 ) -> list[tuple[tuple[float, float], tuple[float, float]]]:
-    points = _decode_point_pairs_best(parameters, vdc_extent=vdc_extent)
+    points = _decode_point_pairs_from_profile(parameters, profile=profile)
     segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
     for idx in range(0, len(points) - 1, 2):
         segments.append((points[idx], points[idx + 1]))
@@ -983,74 +1023,67 @@ def _decode_pairwise_segments(
 def _decode_gdp_polyline_points(
     parameters: bytes,
     *,
-    vdc_extent: tuple[float, float, float, float] | None,
+    profile: _CgmDescriptorProfile,
 ) -> list[tuple[float, float]]:
-    """Best-effort decode for GDP payloads that carry point-like coordinates."""
-    best_points: list[tuple[float, float]] = []
-    best_rank: tuple[float, int] | None = None
-
-    for offset in (0, 2, 4, 6, 8):
-        if offset >= len(parameters):
-            break
-        payload = parameters[offset:]
-
-        for decoder_bias, decoded in (
-            (0.0, _decode_point_pairs_best(payload, vdc_extent=vdc_extent)),
-            (0.25, _decode_point_pairs_heuristic(payload)),
-        ):
-            if len(decoded) < 2:
-                continue
-
-            penalty = _point_penalty(decoded, vdc_extent=vdc_extent)
-            rank = (penalty + decoder_bias + (offset * 0.1), -len(decoded))
-            if best_rank is None or rank < best_rank:
-                best_rank = rank
-                best_points = decoded
-
-    return best_points
+    """Decode GDP payload coordinates using declared VDC descriptors only."""
+    return _decode_point_pairs_from_profile(parameters, profile=profile)
 
 
 def _decode_rectangle_corners(
     parameters: bytes,
     *,
-    vdc_extent: tuple[float, float, float, float] | None,
+    profile: _CgmDescriptorProfile,
 ) -> tuple[tuple[float, float], tuple[float, float]] | None:
-    points = _decode_point_pairs_best(parameters, vdc_extent=vdc_extent)
+    points = _decode_point_pairs_from_profile(parameters, profile=profile)
     if len(points) >= 2:
         return points[0], points[1]
     return None
 
 
-def _decode_circle_data(parameters: bytes) -> tuple[float, float, float] | None:
-    candidates: list[tuple[float, float, float]] = []
-    if len(parameters) >= 12:
-        cx_f32 = _parse_f32_be(parameters[0:4])
-        cy_f32 = _parse_f32_be(parameters[4:8])
-        radius_f32 = _parse_f32_be(parameters[8:12])
-        if cx_f32 is not None and cy_f32 is not None and radius_f32 is not None and radius_f32 > 0:
-            candidates.append((cx_f32, cy_f32, abs(radius_f32)))
+def _decode_circle_data(
+    parameters: bytes,
+    *,
+    profile: _CgmDescriptorProfile,
+) -> tuple[float, float, float] | None:
+    if profile.vdc_type == 0:
+        if profile.vdc_integer_precision is not None and profile.vdc_integer_precision <= 16:
+            if len(parameters) < 6:
+                return None
+            cx_i16 = _decode_i16_be(parameters[0:2])
+            cy_i16 = _decode_i16_be(parameters[2:4])
+            radius_i16 = _decode_i16_be(parameters[4:6])
+            if cx_i16 is None or cy_i16 is None or radius_i16 is None or radius_i16 <= 0:
+                return None
+            return float(cx_i16), float(cy_i16), float(radius_i16)
 
+        if len(parameters) < 12:
+            return None
         cx_i32 = _decode_i32_be(parameters[0:4])
         cy_i32 = _decode_i32_be(parameters[4:8])
         radius_i32 = _decode_i32_be(parameters[8:12])
-        if cx_i32 is not None and cy_i32 is not None and radius_i32 is not None and radius_i32 > 0:
-            candidates.append((float(cx_i32), float(cy_i32), float(radius_i32)))
+        if cx_i32 is None or cy_i32 is None or radius_i32 is None or radius_i32 <= 0:
+            return None
+        return float(cx_i32), float(cy_i32), float(radius_i32)
 
-    if len(parameters) >= 6:
-        cx_i16 = _decode_i16_be(parameters[0:2])
-        cy_i16 = _decode_i16_be(parameters[2:4])
-        radius_i16 = _decode_i16_be(parameters[4:6])
-        if cx_i16 is not None and cy_i16 is not None and radius_i16 is not None and radius_i16 > 0:
-            candidates.append((float(cx_i16), float(cy_i16), float(radius_i16)))
+    if profile.vdc_type == 1:
+        if profile.vdc_real_precision_bits == 64:
+            if len(parameters) < 24:
+                return None
+            cx_f64 = _parse_f64_be(parameters[0:8])
+            cy_f64 = _parse_f64_be(parameters[8:16])
+            radius_f64 = _parse_f64_be(parameters[16:24])
+            if cx_f64 is None or cy_f64 is None or radius_f64 is None or radius_f64 <= 0:
+                return None
+            return cx_f64, cy_f64, abs(radius_f64)
 
-    if candidates:
-        return min(
-            candidates,
-            key=lambda candidate: _coordinate_candidate_penalty(
-                [(candidate[0], candidate[1]), (candidate[0], candidate[1] + candidate[2])],
-                vdc_extent=None,
-            ),
-        )
+        if len(parameters) < 12:
+            return None
+        cx_f32 = _parse_f32_be(parameters[0:4])
+        cy_f32 = _parse_f32_be(parameters[4:8])
+        radius_f32 = _parse_f32_be(parameters[8:12])
+        if cx_f32 is None or cy_f32 is None or radius_f32 is None or radius_f32 <= 0:
+            return None
+        return cx_f32, cy_f32, abs(radius_f32)
 
     return None
 
@@ -1058,9 +1091,9 @@ def _decode_circle_data(parameters: bytes) -> tuple[float, float, float] | None:
 def _decode_ellipse_data(
     parameters: bytes,
     *,
-    vdc_extent: tuple[float, float, float, float] | None,
+    profile: _CgmDescriptorProfile,
 ) -> tuple[float, float, float, float] | None:
-    points = _decode_point_pairs_best(parameters, vdc_extent=vdc_extent)
+    points = _decode_point_pairs_from_profile(parameters, profile=profile)
     if len(points) < 3:
         return None
 
@@ -1198,100 +1231,6 @@ def _analyze_element29_payload(parameters: bytes) -> dict[str, object]:
     }
 
 
-def _collect_element29_decode_candidates(
-    parameters: bytes,
-    *,
-    limit: int = 8,
-) -> list[dict[str, object]]:
-    """Collect top decode candidates for class-4/id-29 payload diagnostics."""
-
-    if imagecodecs is None or not parameters:
-        return []
-
-    candidate_offsets = [
-        *range(0, 33),
-        157,
-        158,
-        159,
-        160,
-        161,
-        176,
-        184,
-        188,
-        192,
-        196,
-        200,
-        208,
-        224,
-        240,
-        256,
-    ]
-    candidate_sizes = [
-        (768, 1099),
-        (767, 1099),
-        (768, 1100),
-        (576, 768),
-        (575, 767),
-    ]
-
-    ranked: list[tuple[float, bool, float, dict[str, object]]] = []
-
-    for offset in candidate_offsets:
-        payload = parameters[offset:]
-        if not payload:
-            continue
-
-        for width, height in candidate_sizes:
-            decode_attempts: list[tuple[bytes, str]] = []
-            try:
-                decode_attempts.append(
-                    (
-                        bytes(imagecodecs.ccittfax4_decode(payload, height=height, width=width)),
-                        "fax4",
-                    )
-                )
-            except (RuntimeError, ValueError):
-                pass
-
-            for t4options in (0, 2, 4, 6, 1, 3, 5, 7):
-                try:
-                    decoded = imagecodecs.ccittfax3_decode(
-                        payload,
-                        height=height,
-                        width=width,
-                        t4options=t4options,
-                    )
-                    decode_attempts.append((bytes(decoded), f"fax3:{t4options}"))
-                except (RuntimeError, ValueError):
-                    continue
-
-            for decoded, decoder_name in decode_attempts:
-                bits = _decode_fax_output_to_bitmap(decoded, width, height)
-                if bits is None:
-                    continue
-
-                for invert in (False, True):
-                    candidate = [1 - bit for bit in bits] if invert else bits
-                    score = _score_bitmap(candidate, width, height)
-                    black_ratio = sum(candidate) / len(candidate)
-                    low_confidence = _is_low_confidence_element29_bitmap(candidate, width, height)
-
-                    candidate_info = {
-                        "offset": offset,
-                        "width": width,
-                        "height": height,
-                        "decoder": decoder_name,
-                        "invert": invert,
-                        "score": round(score, 6),
-                        "black_ratio": round(black_ratio, 6),
-                        "low_confidence": low_confidence,
-                    }
-                    ranked.append((score, low_confidence, abs(black_ratio - 0.5), candidate_info))
-
-    ranked.sort(key=lambda item: (item[0], item[1], item[2]))
-    return [entry for *_meta, entry in ranked[: max(1, limit)]]
-
-
 def _decode_fax_output_to_bitmap(output: bytes, width: int, height: int) -> list[int] | None:
     """Normalize CCITT decoder output to a 0/1 bitmap list.
 
@@ -1323,110 +1262,6 @@ def _decode_fax_output_to_bitmap(output: bytes, width: int, height: int) -> list
     return bits
 
 
-def _score_bitmap(bits: list[int], width: int, height: int) -> float:
-    """Return a polarity-agnostic plausibility score for decoded bitmaps."""
-
-    total = len(bits)
-    if total == 0:
-        return 1e9
-
-    black = sum(bits)
-    black_ratio = black / total
-    dominant_ratio = max(black_ratio, 1.0 - black_ratio)
-    # Reject nearly single-color outputs regardless of polarity.
-    if dominant_ratio >= 0.999:
-        return 1e8
-
-    h_steps = max(1, height // 200)
-    v_steps = max(1, width // 200)
-    h_transitions = 0
-    v_transitions = 0
-
-    for y in range(0, height, h_steps):
-        row = y * width
-        prev = bits[row]
-        for x in range(1, width):
-            cur = bits[row + x]
-            if cur != prev:
-                h_transitions += 1
-            prev = cur
-
-    for x in range(0, width, v_steps):
-        prev = bits[x]
-        for y in range(1, height):
-            cur = bits[y * width + x]
-            if cur != prev:
-                v_transitions += 1
-            prev = cur
-
-    h_samples = max(1, ((height + h_steps - 1) // h_steps) * max(1, width - 1))
-    v_samples = max(1, ((width + v_steps - 1) // v_steps) * max(1, height - 1))
-    h_density = h_transitions / h_samples
-    v_density = v_transitions / v_samples
-
-    if max(h_density, v_density) < 0.001:
-        return 1e8
-
-    transition_ratio = min(h_density, v_density) / max(1e-9, h_density, v_density)
-
-    # Prefer bitmaps with meaningful and reasonably balanced structure in both axes.
-    score = 1.0 - transition_ratio
-    if transition_ratio < 0.2:
-        score += 0.8
-    elif transition_ratio < 0.35:
-        score += 0.3
-
-    if max(h_density, v_density) < 0.01:
-        score += 0.3
-    return score
-
-
-def _is_low_confidence_element29_bitmap(bits: list[int], width: int, height: int) -> bool:
-    """Detect common low-confidence decode artifacts (top-band garbage).
-
-    This check is polarity-agnostic by evaluating the minority pixel class. It
-    rejects outputs where sparse detail is concentrated in only the top portion
-    of the frame, which commonly indicates a wrong offset/dimension decode.
-    """
-
-    total = width * height
-    if total <= 0 or len(bits) != total:
-        return True
-
-    ones = sum(bits)
-    zeros = total - ones
-    minority_value = 1 if ones <= zeros else 0
-    minority_count = min(ones, zeros)
-    minority_ratio = minority_count / total
-
-    # If detail density is not sparse, keep it.
-    if minority_ratio > 0.08:
-        return False
-
-    min_y = height
-    max_y = -1
-    for idx, value in enumerate(bits):
-        if value != minority_value:
-            continue
-        y = idx // width
-        if y < min_y:
-            min_y = y
-        if y > max_y:
-            max_y = y
-
-    if max_y < 0:
-        return True
-
-    band_height = max_y - min_y + 1
-    band_coverage = band_height / height
-    if max_y < int(height * 0.6):
-        return True
-    if band_coverage < 0.5:
-        return True
-
-    return False
-
-
 def _bitmap_to_png_data_uri(bits: list[int], width: int, height: int) -> str | None:
     """Encode a 0/1 bitmap to a PNG data URI if Pillow is available."""
 
@@ -1455,145 +1290,10 @@ def _image_to_png_data_uri(image: Image.Image | None) -> str | None:
     return f"data:image/png;base64,{payload}"
 
 
-def _decode_element29_binary_raster(
-    parameters: bytes,
-    *,
-    allow_low_confidence: bool = False,
-) -> tuple[str, int, int] | None:
-    """Best-effort decode for binary class-4/id-29 payloads using CCITT codecs."""
-
-    if imagecodecs is None:
-        return None
-
-    candidate_offsets = [
-        *range(0, 33),
-        157,
-        158,
-        159,
-        160,
-        161,
-        176,
-        184,
-        188,
-        192,
-        196,
-        200,
-        208,
-        224,
-        240,
-        256,
-    ]
-    candidate_sizes = [
-        (768, 1099),
-        (767, 1099),
-        (768, 1100),
-        (576, 768),
-        (575, 767),
-    ]
-
-    best_score = 1e9
-    best_bits: list[int] | None = None
-    best_size: tuple[int, int] | None = None
-    best_black_ratio = -1.0
-
-    for offset in candidate_offsets:
-        payload = parameters[offset:]
-        if not payload:
-            continue
-
-        for width, height in candidate_sizes:
-            # Try Group 4 first, then Group 3 options.
-            decode_attempts: list[tuple[bytes, str]] = []
-            try:
-                decode_attempts.append(
-                    (
-                        bytes(imagecodecs.ccittfax4_decode(payload, height=height, width=width)),
-                        "fax4",
-                    )
-                )
-            except (RuntimeError, ValueError):
-                pass
-
-            for t4options in (0, 2, 4, 6, 1, 3, 5, 7):
-                try:
-                    decoded = imagecodecs.ccittfax3_decode(
-                        payload,
-                        height=height,
-                        width=width,
-                        t4options=t4options,
-                    )
-                    decode_attempts.append((bytes(decoded), f"fax3:{t4options}"))
-                except (RuntimeError, ValueError):
-                    continue
-
-            for decoded, _decoder_name in decode_attempts:
-                bits = _decode_fax_output_to_bitmap(decoded, width, height)
-                if bits is None:
-                    continue
-
-                for invert in (False, True):
-                    candidate = [1 - bit for bit in bits] if invert else bits
-                    score = _score_bitmap(candidate, width, height)
-                    black_ratio = sum(candidate) / len(candidate)
-                    if score < best_score:
-                        best_score = score
-                        best_bits = candidate
-                        best_size = (width, height)
-                        best_black_ratio = black_ratio
-                    elif abs(score - best_score) <= 1e-9 and black_ratio > best_black_ratio:
-                        # Polarity-agnostic scoring can tie exact inversions; prefer dark canvas
-                        # fallback for these binary element-29 payloads so white detail remains
-                        # visible.
-                        best_bits = candidate
-                        best_size = (width, height)
-                        best_black_ratio = black_ratio
-
-    if best_bits is None or best_size is None:
-        return None
-
-    width, height = best_size
-    if _is_low_confidence_element29_bitmap(best_bits, width, height):
-        if allow_low_confidence:
-            if log.isEnabledFor(logging.DEBUG):
-                log.debug(
-                    "Accepted low-confidence class-4/id-29 raster decode (%dx%d)",
-                    width,
-                    height,
-                )
-        else:
-            if log.isEnabledFor(logging.DEBUG):
-                log.debug(
-                    "Rejected low-confidence class-4/id-29 raster decode (%dx%d)",
-                    width,
-                    height,
-                )
-            return None
-
-    data_uri = _bitmap_to_png_data_uri(best_bits, width, height)
-    if data_uri is None:
-        return None
-    return data_uri, width, height
-
-
-def _decode_best_element29_fallback(
-    payloads: list[bytes],
-) -> tuple[str, int, int] | None:
-    """Decode class-4/id-29 payloads, preferring confident candidates first."""
-    for payload in payloads:
-        decoded = _decode_element29_binary_raster(payload, allow_low_confidence=False)
-        if decoded is not None:
-            return decoded
-
-    for payload in payloads:
-        decoded = _decode_element29_binary_raster(payload, allow_low_confidence=True)
-        if decoded is not None:
-            return decoded
-
-    return None
-
-
-def extract_vector_svg_from_bytes(data: bytes) -> str:
-    """Convert vector-like CGM primitives from bytes into a best-effort SVG string."""
+def extract_vector_svg_from_bytes(
+    data: bytes,
+) -> str:
+    """Convert supported CGM vector primitives and raster tile backgrounds into SVG."""
     style = _SvgStyle()
     color_table = _extract_color_table(data)
     text_items: list[tuple[float, float, str, str, float]] = []
@@ -1607,6 +1307,7 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
     gdp_parameters: list[bytes] = []
     element29_payloads: list[bytes] = []
     vdc_extent: tuple[float, float, float, float] | None = None
+    descriptor_profile = _extract_descriptor_profile(data)
     raster_tile_overlays = _render_first_tile_array_overlays(data)
     raster_background = (
         None if raster_tile_overlays is not None else _render_raster_background_data_uri(data)
@@ -1660,14 +1361,23 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
             continue
 
         if element.element_id == 1:
-            points = _decode_point_pairs_best(element.parameters, vdc_extent=vdc_extent)
+            points = _decode_point_pairs_from_profile(
+                element.parameters,
+                profile=descriptor_profile,
+            )
             if len(points) >= 2:
                 polyline_items.append((points, style.stroke_color, style.stroke_width))
         elif element.element_id == 2:
-            for start, end in _decode_pairwise_segments(element.parameters, vdc_extent=vdc_extent):
+            for start, end in _decode_pairwise_segments(
+                element.parameters,
+                profile=descriptor_profile,
+            ):
                 polyline_items.append(([start, end], style.stroke_color, style.stroke_width))
         elif element.element_id == 3:
-            points = _decode_point_pairs_best(element.parameters, vdc_extent=vdc_extent)
+            points = _decode_point_pairs_from_profile(
+                element.parameters,
+                profile=descriptor_profile,
+            )
             for marker_x, marker_y in points:
                 marker_items.append((marker_x, marker_y, style.stroke_color, style.marker_size))
         elif element.element_id == 4:
@@ -1676,15 +1386,24 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
                 last_x, last_y, last_text, last_color, last_font = text_items[-1]
                 text_items[-1] = (last_x, last_y, f"{last_text}{appended}", last_color, last_font)
         elif element.element_id == 7:
-            points = _decode_point_pairs_best(element.parameters, vdc_extent=vdc_extent)
+            points = _decode_point_pairs_from_profile(
+                element.parameters,
+                profile=descriptor_profile,
+            )
             if len(points) >= 3:
                 polygon_items.append((points, style.stroke_color, style.stroke_width))
         elif element.element_id == 8:
-            points = _decode_point_pairs_best(element.parameters, vdc_extent=vdc_extent)
+            points = _decode_point_pairs_from_profile(
+                element.parameters,
+                profile=descriptor_profile,
+            )
             if len(points) >= 3:
                 polygon_items.append((points, style.stroke_color, style.stroke_width))
         elif element.element_id == 5:
-            xy = _decode_xy(element.parameters, vdc_extent=vdc_extent)
+            xy = _decode_xy(
+                element.parameters,
+                profile=descriptor_profile,
+            )
             if xy is None:
                 continue
             x, y = xy
@@ -1701,7 +1420,10 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
         elif element.element_id in (10, 26):
             gdp_parameters.append(element.parameters)
         elif element.element_id == 11:
-            corners = _decode_rectangle_corners(element.parameters, vdc_extent=vdc_extent)
+            corners = _decode_rectangle_corners(
+                element.parameters,
+                profile=descriptor_profile,
+            )
             if corners is None:
                 continue
             (x1, y1), (x2, y2) = corners
@@ -1716,27 +1438,29 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
                 )
             )
         elif element.element_id == 12:
-            circle = _decode_circle_data(element.parameters)
+            circle = _decode_circle_data(element.parameters, profile=descriptor_profile)
             if circle is None:
                 continue
             cx, cy, radius = circle
             circle_items.append((cx, cy, radius, style.stroke_color, style.stroke_width))
         elif element.element_id in (13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 27):
-            arc_points = _decode_point_pairs_best(element.parameters, vdc_extent=vdc_extent)
+            arc_points = _decode_point_pairs_from_profile(
+                element.parameters,
+                profile=descriptor_profile,
+            )
             if len(arc_points) >= 2:
                 polyline_items.append((arc_points, style.stroke_color, style.stroke_width))
         elif element.element_id == 28:
-            # Element 28 payloads are profile-specific and often include packed
-            # control bytes mixed with coordinates. Recover only plausible
-            # contiguous runs inside the declared VDC envelope.
-            raw_points = _decode_point_pairs_i16(element.parameters)
-            for run in _extract_vdc_bounded_runs(raw_points, vdc_extent=vdc_extent):
-                polyline_items.append((run, style.stroke_color, style.stroke_width))
+            # Profile-specific mixed payload; strict mode does not infer a vector fallback.
+            continue
         elif element.element_id == 9:
             # Cell Array payloads are handled through raster background extraction.
             continue
         elif element.element_id == 17:
-            ellipse = _decode_ellipse_data(element.parameters, vdc_extent=vdc_extent)
+            ellipse = _decode_ellipse_data(
+                element.parameters,
+                profile=descriptor_profile,
+            )
             if ellipse is None:
                 continue
             cx, cy, rx, ry = ellipse
@@ -1752,7 +1476,10 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
                 element29_payloads.append(element.parameters)
 
     for parameters in gdp_parameters:
-        points = _decode_gdp_polyline_points(parameters, vdc_extent=vdc_extent)
+        points = _decode_gdp_polyline_points(
+            parameters,
+            profile=descriptor_profile,
+        )
         if len(points) >= 2:
             polyline_items.append((points, style.stroke_color, style.stroke_width))
 
@@ -1868,8 +1595,6 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
     for points, stroke_color, stroke_width in polyline_items:
         point_str = _format_points(
             points,
-            min_x=min_x,
-            max_x=max_x,
             min_y=min_y,
             max_y=max_y,
         )
@@ -1881,8 +1606,6 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
     for points, stroke_color, stroke_width in polygon_items:
         point_str = _format_points(
             points,
-            min_x=min_x,
-            max_x=max_x,
             min_y=min_y,
             max_y=max_y,
         )
@@ -1953,32 +1676,24 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
         and raster_background is None
         and element29_payloads
     ):
-        decoded = _decode_best_element29_fallback(element29_payloads)
-        if decoded is not None:
-            href, raster_width, raster_height = decoded
-            svg_lines.append(
-                f'  <image x="{min_x:.3f}" y="{min_y:.3f}" width="{width:.3f}" '
-                f'height="{height:.3f}" preserveAspectRatio="xMidYMid meet" '
-                f'image-rendering="pixelated" href="{href}"{clip_attr} />'
-            )
-            if log.isEnabledFor(logging.DEBUG):
-                log.debug(
-                    "Rendered class-4/id-29 payload as raster image (%dx%d)",
-                    raster_width,
-                    raster_height,
-                )
+        # Class-4/id-29 raster fallback is not implemented without explicit standard metadata.
+        pass
 
     svg_lines.append("</svg>")
     return "\n".join(svg_lines) + "\n"
 
 
-def extract_vector_svg(file_path: str | Path) -> str:
-    """Convert a CGM file to a best-effort SVG document string."""
+def extract_vector_svg(
+    file_path: str | Path,
+) -> str:
+    """Convert a CGM file to SVG using the supported vector and raster paths."""
     path = Path(file_path)
     raw = path.read_bytes()
     if log.isEnabledFor(logging.DEBUG):
         log.debug("Loaded CGM file %s (%d bytes) for vector SVG conversion", path, len(raw))
-    return extract_vector_svg_from_bytes(raw)
+    return extract_vector_svg_from_bytes(
+        raw,
+    )
 
 
 def extract_vector_svg_to_directory(
@@ -1991,14 +1706,18 @@ def extract_vector_svg_to_directory(
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     target = out_dir / f"{stem}_0000.svg"
-    svg = extract_vector_svg(file_path)
+    svg = extract_vector_svg(
+        file_path,
+    )
     target.write_text(svg, encoding="utf-8")
     if log.isEnabledFor(logging.DEBUG):
         log.debug("Wrote vector SVG: %s", target)
     return target
 
 
-def _build_data_snapshot(data: bytes) -> dict[str, object]:
+def _build_data_snapshot(
+    data: bytes,
+) -> dict[str, object]:
     element_histogram: Counter[tuple[int, int]] = Counter()
     elements: list[dict[str, object]] = []
     element29_analysis: list[dict[str, object]] = []
@@ -2016,15 +1735,12 @@ def _build_data_snapshot(data: bytes) -> dict[str, object]:
             }
         )
         if element.class_id == 4 and element.element_id == 29:
-            candidates = _collect_element29_decode_candidates(element.parameters)
             element29_analysis.append(
                 {
                     "offset": element.offset,
                     **_analyze_element29_payload(element.parameters),
-                    "decode_candidates": candidates,
-                    "has_plausible_decode": any(
-                        not item.get("low_confidence", True) for item in candidates
-                    ),
+                    "decode_candidates": [],
+                    "has_plausible_decode": False,
                 }
             )
 
@@ -2075,23 +1791,33 @@ def _build_data_snapshot(data: bytes) -> dict[str, object]:
         "element29_analysis": element29_analysis,
         "raw_images": raw_image_items,
         "hotspots": hotspot_items,
-        "vector_svg": extract_vector_svg_from_bytes(data),
+        "vector_svg": extract_vector_svg_from_bytes(
+            data,
+        ),
     }
 
 
-def extract_data_json_from_bytes(data: bytes) -> str:
+def extract_data_json_from_bytes(
+    data: bytes,
+) -> str:
     """Serialize parsed CGM content, extracted payloads, and SVG into JSON."""
-    snapshot = _build_data_snapshot(data)
+    snapshot = _build_data_snapshot(
+        data,
+    )
     return json.dumps(snapshot, indent=2)
 
 
-def extract_data_json(file_path: str | Path) -> str:
+def extract_data_json(
+    file_path: str | Path,
+) -> str:
     """Load a CGM file and serialize parsed data to JSON."""
     path = Path(file_path)
     raw = path.read_bytes()
     if log.isEnabledFor(logging.DEBUG):
         log.debug("Loaded CGM file %s (%d bytes) for JSON export", path, len(raw))
-    return extract_data_json_from_bytes(raw)
+    return extract_data_json_from_bytes(
+        raw,
+    )
 
 
 def extract_data_json_to_directory(
@@ -2104,7 +1830,9 @@ def extract_data_json_to_directory(
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     target = out_dir / f"{stem}_0000.json"
-    json_text = extract_data_json(file_path)
+    json_text = extract_data_json(
+        file_path,
+    )
     target.write_text(json_text + "\n", encoding="utf-8")
     if log.isEnabledFor(logging.DEBUG):
         log.debug("Wrote data JSON: %s", target)
@@ -2406,7 +2134,9 @@ def _append_tile_record(
     )
 
 
-def _finalize_tile_array_record(array: dict[str, object]) -> dict[str, object] | None:
+def _finalize_tile_array_record(
+    array: dict[str, object],
+) -> dict[str, object] | None:
     tiles = array.get("tiles")
     if not isinstance(tiles, list) or not tiles:
         return None
@@ -2418,24 +2148,6 @@ def _finalize_tile_array_record(array: dict[str, object]) -> dict[str, object] |
     total_w = _coerce_int(array.get("total_width", 1))
     total_h = _coerce_int(array.get("total_height", 1))
 
-    tile_pixels = max(1, tile_w * tile_h)
-    for tile in tiles:
-        if not isinstance(tile, dict):
-            continue
-        payload = tile.get("payload")
-        if not isinstance(payload, (bytes, bytearray)):
-            continue
-        if isinstance(tile.get("family"), str):
-            continue
-        local_color_precision = tile.get("local_color_precision")
-        # Safe default: one-byte-per-pixel tiles are treated as indexed when
-        # metadata suggests palette-friendly precision (or no metadata exists).
-        if tile_pixels <= len(payload) < tile_pixels * 2 and (
-            local_color_precision is None
-            or (isinstance(local_color_precision, int) and local_color_precision <= 8)
-        ):
-            tile["family"] = "indexed"
-
     return _make_tile_array_record(
         cols=cols,
         rows=rows,
@@ -2446,7 +2158,9 @@ def _finalize_tile_array_record(array: dict[str, object]) -> dict[str, object] |
     ) | {"tiles": tiles}
 
 
-def _parse_binary_tile_arrays(data: bytes) -> list[dict[str, object]]:
+def _parse_binary_tile_arrays(
+    data: bytes,
+) -> list[dict[str, object]]:
     """Synthesize tile-array metadata from binary Cell Array sequences."""
     array = _make_tile_array_record(
         cols=1,
@@ -2516,15 +2230,16 @@ def _parse_binary_tile_arrays(data: bytes) -> list[dict[str, object]]:
     return [finalized] if finalized is not None else []
 
 
-def _parse_tile_arrays(data: bytes) -> list[dict[str, object]]:
-    """Parse tile-array metadata from text commands or synthesized binary hints."""
-    text_arrays = _parse_text_tile_arrays(data)
-    if text_arrays:
-        return text_arrays
-    return _parse_binary_tile_arrays(data)
+def _parse_tile_arrays(
+    data: bytes,
+) -> list[dict[str, object]]:
+    """Parse tile-array metadata from explicit text commands only."""
+    return _parse_text_tile_arrays(data)
 
 
-def _parse_text_tile_arrays(data: bytes) -> list[dict[str, object]]:
+def _parse_text_tile_arrays(
+    data: bytes,
+) -> list[dict[str, object]]:
     try:
         text = data.decode("latin-1")
     except UnicodeDecodeError:
@@ -2564,7 +2279,8 @@ def _parse_text_tile_arrays(data: bytes) -> list[dict[str, object]]:
         if command in _TEXT_TILE_COMMAND_FAMILY and current is not None:
             payload = _extract_hex_payload(statement)
             if payload:
-                numbers = _extract_text_numbers(statement)
+                metadata_prefix = statement.split("''", 1)[0].split('""', 1)[0]
+                numbers = _extract_text_numbers(metadata_prefix)
                 compression = round(numbers[0]) if numbers else None
                 local_color_precision = round(numbers[1]) if len(numbers) >= 2 else None
                 bit_order = round(numbers[2]) if len(numbers) >= 3 else None
@@ -2717,7 +2433,6 @@ def _decode_bitonal_payload_with_details(
     preferred_signature: tuple[str, str, bool] | None = None,
     preferred_dimensions: tuple[int, int] | None = None,
 ) -> tuple[Image.Image | None, dict[str, object]]:
-    preferred_score_tolerance = 0.03
     if Image is None or imagecodecs is None or width <= 0 or height <= 0:
         return None, {
             "best_score": None,
@@ -2726,206 +2441,167 @@ def _decode_bitonal_payload_with_details(
             "attempts": [],
         }
 
-    best_bits: list[int] | None = None
-    best_score = 1e9
-    best_candidate: dict[str, object] | None = None
-    best_preferred_bits: list[int] | None = None
-    best_preferred_score = 1e9
-    best_preferred_candidate: dict[str, object] | None = None
-    attempts: list[dict[str, object]] = []
-
-    width_candidates = [width]
-    if width > 2:
-        width_candidates.extend([width - 1, width + 1])
-    height_candidates = [height]
-    if height > 2:
-        height_candidates.extend([height - 1, height + 1])
-
-    size_candidates: list[tuple[int, int]] = []
-    seen_sizes: set[tuple[int, int]] = set()
-    for cand_w in width_candidates:
-        for cand_h in height_candidates:
-            key = (cand_w, cand_h)
-            if key in seen_sizes or cand_w <= 0 or cand_h <= 0:
-                continue
-            seen_sizes.add(key)
-            size_candidates.append(key)
-
-    payload_candidates = _payload_variants(payload)
-    if bit_order == 1 and len(payload_candidates) > 1:
-        payload_candidates = [payload_candidates[1], payload_candidates[0]]
-
-    for encoded in payload_candidates:
-        encoded_variant = "bit_reversed" if encoded != payload else "as_is"
-
-        # Some profiles store uncompressed packed bits; attempt this path too.
+    if compression == 0:
         row_bytes = (width + 7) // 8
-        packed_needed = row_bytes * height
-        if len(encoded) >= packed_needed:
-            packed_bits = _decode_fax_output_to_bitmap(encoded, width, height)
-            if packed_bits is not None:
-                for invert in (False, True):
-                    candidate = [1 - bit for bit in packed_bits] if invert else packed_bits
-                    score = _score_bitmap(candidate, width, height)
-                    if compression == 0:
-                        score -= 0.2
-                    signature = ("packed_raw", encoded_variant, invert)
-                    attempts.append(
-                        {
-                            "decoder": "packed_raw",
-                            "encoded_variant": encoded_variant,
-                            "width": width,
-                            "height": height,
-                            "invert": invert,
-                            "score": round(score, 6),
-                        }
-                    )
-                    if score < best_score:
-                        best_score = score
-                        best_bits = candidate
-                        best_candidate = {
-                            "decoder": "packed_raw",
-                            "encoded_variant": encoded_variant,
-                            "width": width,
-                            "height": height,
-                            "invert": invert,
-                            "score": round(score, 6),
-                        }
-                    if preferred_signature is not None and signature == preferred_signature:
-                        if preferred_dimensions is not None and preferred_dimensions != (
-                            width,
-                            height,
-                        ):
-                            continue
-                        if score < best_preferred_score:
-                            best_preferred_score = score
-                            best_preferred_bits = candidate
-                            best_preferred_candidate = {
-                                "decoder": "packed_raw",
-                                "encoded_variant": encoded_variant,
-                                "width": width,
-                                "height": height,
-                                "invert": invert,
-                                "score": round(score, 6),
-                            }
+        needed = row_bytes * height
+        if len(payload) < needed:
+            return None, {
+                "best_score": None,
+                "candidate_count": 0,
+                "best_candidate": None,
+                "preferred_signature": preferred_signature,
+                "preferred_dimensions": preferred_dimensions,
+                "used_preferred_signature": False,
+                "attempts": [],
+            }
 
-        for cand_w, cand_h in size_candidates:
-            decode_attempts: list[tuple[str, bytes]] = []
-            # Respect declared compression when present to avoid pathological brute-force loops.
-            allow_fax4 = compression in (None, 2)
-            allow_fax3 = compression in (None, 1)
+        bits: list[int] = []
+        packed = payload[:needed]
+        if bit_order == 1:
+            packed = bytes(_reverse_bits_in_byte(byte) for byte in packed)
+        for y in range(height):
+            row_start = y * row_bytes
+            for x in range(width):
+                value = packed[row_start + (x // 8)]
+                bits.append((value >> (7 - (x % 8))) & 1)
 
-            if allow_fax4:
-                try:
-                    decode_attempts.append(
-                        (
-                            "fax4",
-                            bytes(
-                                imagecodecs.ccittfax4_decode(encoded, height=cand_h, width=cand_w)
-                            ),
-                        )
-                    )
-                except (RuntimeError, ValueError):
-                    pass
-
-            if allow_fax3:
-                for t4options in (0, 2, 4, 6, 1, 3, 5, 7):
-                    try:
-                        decoded = imagecodecs.ccittfax3_decode(
-                            encoded,
-                            height=cand_h,
-                            width=cand_w,
-                            t4options=t4options,
-                        )
-                        decode_attempts.append((f"fax3:{t4options}", bytes(decoded)))
-                    except (RuntimeError, ValueError):
-                        continue
-
-            for decoder_name, decoded in decode_attempts:
-                bits = _decode_fax_output_to_bitmap(decoded, cand_w, cand_h)
-                if bits is None:
-                    continue
-
-                if cand_w != width or cand_h != height:
-                    tmp_pixels = bytes(0 if bit else 255 for bit in bits)
-                    tmp_img = Image.frombytes("L", (cand_w, cand_h), tmp_pixels)
-                    tmp_img = tmp_img.resize((width, height), resample=Image.NEAREST)
-                    bits = [1 if value == 0 else 0 for value in tmp_img.tobytes()]
-
-                for invert in (False, True):
-                    candidate = [1 - bit for bit in bits] if invert else bits
-                    score = _score_bitmap(candidate, width, height)
-                    if compression in (1, 2):
-                        score -= 0.05
-                    signature = (decoder_name, encoded_variant, invert)
-                    attempts.append(
-                        {
-                            "decoder": decoder_name,
-                            "encoded_variant": encoded_variant,
-                            "width": cand_w,
-                            "height": cand_h,
-                            "invert": invert,
-                            "score": round(score, 6),
-                        }
-                    )
-                    if score < best_score:
-                        best_score = score
-                        best_bits = candidate
-                        best_candidate = {
-                            "decoder": decoder_name,
-                            "encoded_variant": encoded_variant,
-                            "width": cand_w,
-                            "height": cand_h,
-                            "invert": invert,
-                            "score": round(score, 6),
-                        }
-                    if preferred_signature is not None and signature == preferred_signature:
-                        if preferred_dimensions is not None and preferred_dimensions != (
-                            cand_w,
-                            cand_h,
-                        ):
-                            continue
-                        if score < best_preferred_score:
-                            best_preferred_score = score
-                            best_preferred_bits = candidate
-                            best_preferred_candidate = {
-                                "decoder": decoder_name,
-                                "encoded_variant": encoded_variant,
-                                "width": cand_w,
-                                "height": cand_h,
-                                "invert": invert,
-                                "score": round(score, 6),
-                            }
-
-    use_preferred = False
-    if preferred_signature is not None and best_preferred_bits is not None:
-        # Keep global consistency only when it does not materially degrade local decode quality.
-        if best_bits is None or best_preferred_score <= (best_score + preferred_score_tolerance):
-            use_preferred = True
-    selected_bits = best_preferred_bits if use_preferred else best_bits
-    selected_score = best_preferred_score if use_preferred else best_score
-    selected_candidate = best_preferred_candidate if use_preferred else best_candidate
-
-    if selected_bits is None:
-        return None, {
+        pixels = bytes(0 if bit else 255 for bit in bits)
+        return Image.frombytes("L", (width, height), pixels), {
             "best_score": None,
-            "candidate_count": len(attempts),
-            "best_candidate": None,
+            "candidate_count": 1,
+            "best_candidate": {
+                "decoder": "packed_raw",
+                "encoded_variant": "as_is",
+                "width": width,
+                "height": height,
+                "invert": False,
+                "score": None,
+            },
             "preferred_signature": preferred_signature,
             "preferred_dimensions": preferred_dimensions,
             "used_preferred_signature": False,
-            "attempts": attempts,
+            "attempts": [
+                {
+                    "decoder": "packed_raw",
+                    "encoded_variant": "as_is",
+                    "width": width,
+                    "height": height,
+                    "invert": False,
+                    "score": None,
+                }
+            ],
         }
 
-    pixels = bytes(0 if bit else 255 for bit in selected_bits)
-    return Image.frombytes("L", (width, height), pixels), {
-        "best_score": round(selected_score, 6),
-        "candidate_count": len(attempts),
-        "best_candidate": selected_candidate,
+    if compression == 1:
+        try:
+            decoded = bytes(imagecodecs.ccittfax3_decode(payload, height=height, width=width))
+        except (RuntimeError, ValueError):
+            return None, {
+                "best_score": None,
+                "candidate_count": 0,
+                "best_candidate": None,
+                "preferred_signature": preferred_signature,
+                "preferred_dimensions": preferred_dimensions,
+                "used_preferred_signature": False,
+                "attempts": [],
+            }
+        decoded_bits = _decode_fax_output_to_bitmap(decoded, width, height)
+        if decoded_bits is None:
+            return None, {
+                "best_score": None,
+                "candidate_count": 0,
+                "best_candidate": None,
+                "preferred_signature": preferred_signature,
+                "preferred_dimensions": preferred_dimensions,
+                "used_preferred_signature": False,
+                "attempts": [],
+            }
+        pixels = bytes(0 if bit else 255 for bit in decoded_bits)
+        return Image.frombytes("L", (width, height), pixels), {
+            "best_score": None,
+            "candidate_count": 1,
+            "best_candidate": {
+                "decoder": "fax3:exact",
+                "encoded_variant": "as_is",
+                "width": width,
+                "height": height,
+                "invert": False,
+                "score": None,
+            },
+            "preferred_signature": preferred_signature,
+            "preferred_dimensions": preferred_dimensions,
+            "used_preferred_signature": False,
+            "attempts": [
+                {
+                    "decoder": "fax3:exact",
+                    "encoded_variant": "as_is",
+                    "width": width,
+                    "height": height,
+                    "invert": False,
+                    "score": None,
+                }
+            ],
+        }
+
+    if compression == 2:
+        try:
+            decoded = bytes(imagecodecs.ccittfax4_decode(payload, height=height, width=width))
+        except (RuntimeError, ValueError):
+            return None, {
+                "best_score": None,
+                "candidate_count": 0,
+                "best_candidate": None,
+                "preferred_signature": preferred_signature,
+                "preferred_dimensions": preferred_dimensions,
+                "used_preferred_signature": False,
+                "attempts": [],
+            }
+        decoded_bits = _decode_fax_output_to_bitmap(decoded, width, height)
+        if decoded_bits is None:
+            return None, {
+                "best_score": None,
+                "candidate_count": 0,
+                "best_candidate": None,
+                "preferred_signature": preferred_signature,
+                "preferred_dimensions": preferred_dimensions,
+                "used_preferred_signature": False,
+                "attempts": [],
+            }
+        pixels = bytes(0 if bit else 255 for bit in decoded_bits)
+        return Image.frombytes("L", (width, height), pixels), {
+            "best_score": None,
+            "candidate_count": 1,
+            "best_candidate": {
+                "decoder": "fax4",
+                "encoded_variant": "as_is",
+                "width": width,
+                "height": height,
+                "invert": False,
+                "score": None,
+            },
+            "preferred_signature": preferred_signature,
+            "preferred_dimensions": preferred_dimensions,
+            "used_preferred_signature": False,
+            "attempts": [
+                {
+                    "decoder": "fax4",
+                    "encoded_variant": "as_is",
+                    "width": width,
+                    "height": height,
+                    "invert": False,
+                    "score": None,
+                }
+            ],
+        }
+
+    return None, {
+        "best_score": None,
+        "candidate_count": 0,
+        "best_candidate": None,
         "preferred_signature": preferred_signature,
         "preferred_dimensions": preferred_dimensions,
-        "used_preferred_signature": use_preferred,
-        "attempts": attempts,
+        "used_preferred_signature": False,
+        "attempts": [],
     }
 
 
@@ -3027,7 +2703,9 @@ def _coerce_int(value: object, default: int = 1) -> int:
     return default
 
 
-def _render_first_tile_array(data: bytes) -> Image.Image | None:
+def _render_first_tile_array(
+    data: bytes,
+) -> Image.Image | None:
     if Image is None:
         return None
 
@@ -3182,7 +2860,9 @@ def _render_first_tile_array_overlays(
     return None
 
 
-def _render_raster_background_data_uri(data: bytes) -> tuple[str, int, int] | None:
+def _render_raster_background_data_uri(
+    data: bytes,
+) -> tuple[str, int, int] | None:
     tiled = _render_first_tile_array(data)
     if tiled is not None:
         href = _image_to_png_data_uri(tiled)
@@ -3222,7 +2902,10 @@ def extract_rendered_images_to_directory(
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     svg_path = out_dir / f"{stem}_0000.svg"
-    svg_path.write_text(extract_vector_svg_from_bytes(raw), encoding="utf-8")
+    svg_path.write_text(
+        extract_vector_svg_from_bytes(raw),
+        encoding="utf-8",
+    )
     written.append(svg_path)
 
     if debug_report:
