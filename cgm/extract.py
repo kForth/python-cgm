@@ -2364,6 +2364,7 @@ def _decode_tile_payload_to_image(
     indexed_palette: bytes | None = None,
     color_value_extent: tuple[int, int, int, int, int, int] | None = None,
     row_padding: int | None = None,
+    orientation: int | None = None,
 ) -> Image.Image | None:
     """Decode tile payloads across bitonal and direct-color encodings."""
     if Image is None or width <= 0 or height <= 0:
@@ -2422,27 +2423,66 @@ def _decode_tile_payload_to_image(
         row_padding=row_padding,
     )
     if image is not None:
-        return image
+        return _apply_tile_orientation(image, orientation)
 
     if len(payload) >= total * 4:
-        return Image.frombytes("RGBA", (width, height), payload[: total * 4])
+        return _apply_tile_orientation(
+            Image.frombytes("RGBA", (width, height), payload[: total * 4]), orientation
+        )
 
     if len(payload) >= total * 3:
-        return Image.frombytes("RGB", (width, height), payload[: total * 3])
+        return _apply_tile_orientation(
+            Image.frombytes("RGB", (width, height), payload[: total * 3]), orientation
+        )
 
     if len(payload) >= total * 2:
         # Common 16-bit grayscale payloads can be approximated by high bytes.
         gray16 = payload[: total * 2]
         gray8 = bytes(gray16[idx] for idx in range(0, len(gray16), 2))
-        return Image.frombytes("L", (width, height), gray8)
+        return _apply_tile_orientation(Image.frombytes("L", (width, height), gray8), orientation)
 
     if len(payload) >= total:
         sample = payload[:total]
         unique = set(sample)
         if unique.issubset({0, 1}):
             sample = bytes(0 if value else 255 for value in sample)
-        return Image.frombytes("L", (width, height), sample)
+        return _apply_tile_orientation(Image.frombytes("L", (width, height), sample), orientation)
 
+    return None
+
+
+def _apply_tile_orientation(image: Image.Image, orientation: int | None) -> Image.Image:
+    """Apply CGM BITONALTILE orientation transform to a decoded tile image.
+
+    Currently a no-op — the orientation field is stored in the tile record but
+    not applied here because the CGM rendering pipeline (VDC coordinate mapping
+    and raster tile placement) already produces the correct on-screen orientation
+    without an additional image flip.  The parameter is retained for future use
+    if files that require an explicit transform are encountered.
+    """
+    return image
+
+
+def _find_t6_eofb_bit_offset(payload: bytes) -> int | None:
+    """Return the bit offset of the T.6 EOFB marker in *payload*, or None.
+
+    The EOFB is two consecutive 12-bit strings ``000000000001`` (= 24 bits,
+    hex ``0x001001``).  It is searched only in the last 16 bytes of the
+    payload — a practical optimisation that covers all well-formed streams.
+    """
+    n = len(payload)
+    if n < 3:
+        return None
+    # Search only the last 16 bytes to stay fast.
+    start_byte = max(0, n - 16)
+    for byte_idx in range(start_byte, n - 2):
+        # Load 4 bytes as a big-endian integer (zero-pad at the end).
+        chunk_bytes = payload[byte_idx : min(byte_idx + 4, n)]
+        chunk = int.from_bytes(chunk_bytes.ljust(4, b"\x00"), "big")
+        for bit_off in range(8):
+            window = (chunk >> (8 - bit_off)) & 0xFFFFFF
+            if window == 0x001001:
+                return byte_idx * 8 + bit_off
     return None
 
 
@@ -2568,16 +2608,41 @@ def _decode_bitonal_payload_with_details(
         }
 
     if compression == 2:
-        # T.6 (G4) rows may have alignment padding appended per the row_padding
-        # field.  imagecodecs treats the payload as a flat bitstream; padding bits
-        # are read as data, corrupting subsequent rows.  Compensate by trying up to
-        # three decode widths and keeping the one that produces the fewest
-        # all-black rows (a reliable proxy for T.6 misalignment artifacts).
+        # Use the T.6 EOFB position to validate the nominal decode before
+        # attempting any width-adjustment trial.
+        #
+        # The EOFB marker (000000000001 000000000001) appears at the end of the
+        # T.6 bitstream.  Its position tells us how many rows are actually encoded:
+        #
+        #   • EOFB near the end of the payload  → all *height* rows are encoded;
+        #     trailing all-white rows in the decoded image are legitimate (drawn
+        #     empty areas), not imagecodecs fill.  No width adjustment is needed
+        #     if the nominal decode already has zero solid-black-row artifacts.
+        #
+        #   • No EOFB found or EOFB early in the payload  → stream may be
+        #     incomplete or the nominal decode is consuming extra padding bits
+        #     as data.  Apply the multi-width trial with truncation guard.
+        #
+        # T.6 (G4) rows may also have alignment padding appended per the
+        # row_padding field.  The multi-width trial (below) compensates by
+        # trying three decode widths and choosing the one that best balances:
+        #   sbr  - solid-black rows  (>95 % black): T.6 misalignment artifact
+        #   twr  - trailing all-white rows: stream depleted early by a wider
+        #          decode width consuming too many bits per row
+        _eofb_bit = _find_t6_eofb_bit_offset(payload)
+        _payload_bits = len(payload) * 8
+        # "Near end" = EOFB within the last 20 % of payload bits.
+        _eofb_near_end = _eofb_bit is not None and _eofb_bit >= _payload_bits * 0.8
+
         _try_widths: list[int] = [width]
-        if isinstance(row_padding, int) and row_padding > 0:
+        if isinstance(row_padding, int) and row_padding > 8:
+            # Try width + row_padding//2.  The full width + row_padding often
+            # depletes the bitstream early (truncation); the half-padding value
+            # is a better approximation of the average per-row alignment cost
+            # and avoids introducing new trailing-white artefacts.
+            _try_widths.append(width + row_padding // 2)
+        elif isinstance(row_padding, int) and 0 < row_padding <= 8:
             _try_widths.append(width + row_padding)
-            if row_padding > 8:
-                _try_widths.append(width + row_padding // 2)
         # Deduplicate while preserving order.
         _seen_w: set[int] = set()
         _unique_widths: list[int] = []
@@ -2586,40 +2651,90 @@ def _decode_bitonal_payload_with_details(
                 _seen_w.add(_w)
                 _unique_widths.append(_w)
 
-        _best_img: Image.Image | None = None
-        _best_sbr: int = height + 1  # "solid-black-row" artifact count; lower is better
-
-        for _w in _unique_widths:
+        def _fax4_try(w: int) -> tuple[Image.Image | None, int, int]:
+            """Decode at width w; return (image, sbr, twr) or (None, large, large)."""
+            _inf = height + 1
             try:
-                _raw = bytes(imagecodecs.ccittfax4_decode(payload, height=height, width=_w))
+                _raw = bytes(imagecodecs.ccittfax4_decode(payload, height=height, width=w))
             except (RuntimeError, ValueError):
-                continue
-            # Strip the extra padding columns when we decoded at a wider width.
-            if _w > width:
+                return None, _inf, _inf
+            if w > width:
                 _stripped = bytearray()
                 for _r in range(height):
-                    _stripped.extend(_raw[_r * _w : _r * _w + width])
+                    _stripped.extend(_raw[_r * w : _r * w + width])
                 _raw = bytes(_stripped)
             _bits = _decode_fax_output_to_bitmap(_raw, width, height)
             if _bits is None:
-                continue
-            # Count rows that are >95% black as a T.6 artifact score.
+                return None, _inf, _inf
+            # Solid-black-row count (T.6 misalignment artifact).
             _sbr = sum(
                 1
                 for _r in range(height)
                 if sum(_bits[_r * width : (_r + 1) * width]) / width > 0.95
             )
-            if _sbr < _best_sbr:
-                _best_sbr = _sbr
-                _best_img = Image.frombytes(
-                    "L",
-                    (width, height),
-                    bytes(0 if b else 255 for b in _bits),
-                )
-            if _best_sbr == 0:
-                break  # perfect decode found
+            # Trailing contiguous all-white rows (truncation artifact).
+            _twr = 0
+            for _r in range(height - 1, -1, -1):
+                if sum(_bits[_r * width : (_r + 1) * width]) == 0:
+                    _twr += 1
+                else:
+                    break
+            _px = bytes(0 if b else 255 for b in _bits)
+            return Image.frombytes("L", (width, height), _px), _sbr, _twr
 
-        if _best_img is None:
+        # Collect scored candidates.
+        _candidates: list[tuple[int, Image.Image, int, int]] = []  # (w, img, sbr, twr)
+
+        # EOFB-based fast path: if the EOFB is near the end of the payload the
+        # nominal width is row-count correct.  Decode at the nominal width first;
+        # return immediately only if the decode is completely clean (sbr=0).
+        # Any non-zero sbr, however small, still warrants trying the alternative
+        # half-padding width — some tiles have genuine T.6 row-alignment drift
+        # that produces 10-25 solid-black rows which the +P/2 width eliminates.
+        if _eofb_near_end:
+            _nom_img, _nom_sbr, _nom_twr = _fax4_try(width)
+            if _nom_img is not None:
+                _candidates.append((width, _nom_img, _nom_sbr, _nom_twr))
+                if _nom_sbr == 0 and _nom_twr == 0:
+                    # Nominal decode is completely clean — skip alternative widths.
+                    return _nom_img, {
+                        "best_score": None,
+                        "candidate_count": 1,
+                        "best_candidate": {
+                            "decoder": "fax4",
+                            "encoded_variant": "as_is",
+                            "width": width,
+                            "height": height,
+                            "invert": False,
+                            "score": None,
+                        },
+                        "preferred_signature": preferred_signature,
+                        "preferred_dimensions": preferred_dimensions,
+                        "used_preferred_signature": False,
+                        "attempts": [
+                            {
+                                "decoder": "fax4",
+                                "encoded_variant": "as_is",
+                                "width": width,
+                                "height": height,
+                                "invert": False,
+                                "score": None,
+                            }
+                        ],
+                    }
+            # Nominal has sbr > 0 despite EOFB being valid — may be T.6 misalignment;
+            # try the alternative half-padding width.
+            for _w in _unique_widths[1:]:
+                _img, _sbr, _twr = _fax4_try(_w)
+                if _img is not None:
+                    _candidates.append((_w, _img, _sbr, _twr))
+        else:
+            for _w in _unique_widths:
+                _img, _sbr, _twr = _fax4_try(_w)
+                if _img is not None:
+                    _candidates.append((_w, _img, _sbr, _twr))
+
+        if not _candidates:
             return None, {
                 "best_score": None,
                 "candidate_count": 0,
@@ -2629,6 +2744,24 @@ def _decode_bitonal_payload_with_details(
                 "used_preferred_signature": False,
                 "attempts": [],
             }
+
+        # Baseline truncation level from the nominal width decode.
+        _nom = next((_twr for _w, _, _sbr, _twr in _candidates if _w == width), height)
+        _max_twr = _nom + max(1, height // 10)
+
+        # Keep only candidates that don't introduce significantly more truncation
+        # than the nominal decode.
+        _valid = [
+            (_w, _img, _sbr, _twr) for _w, _img, _sbr, _twr in _candidates if _twr <= _max_twr
+        ]
+        if not _valid:
+            # All padded widths cause truncation; fall back to the nominal decode.
+            _valid = [(_w, _img, _sbr, _twr) for _w, _img, _sbr, _twr in _candidates if _w == width]
+
+        # Among valid candidates pick the one with fewest artifact rows, breaking
+        # ties by preferring less truncation.
+        _, _best_img, _, _ = min(_valid, key=lambda t: (t[2], t[3]))
+
         return _best_img, {
             "best_score": None,
             "candidate_count": 1,
@@ -2838,6 +2971,9 @@ def _render_first_tile_array(
                 row_padding=tile_payload.get("row_padding")
                 if isinstance(tile_payload.get("row_padding"), int)
                 else None,
+                orientation=tile_payload.get("orientation")
+                if isinstance(tile_payload.get("orientation"), int)
+                else None,
                 indexed_palette=indexed_palette,
                 color_value_extent=color_value_extent,
             )
@@ -2916,6 +3052,9 @@ def _render_first_tile_array_overlays(
                 else None,
                 row_padding=tile_payload.get("row_padding")
                 if isinstance(tile_payload.get("row_padding"), int)
+                else None,
+                orientation=tile_payload.get("orientation")
+                if isinstance(tile_payload.get("orientation"), int)
                 else None,
                 indexed_palette=indexed_palette,
                 color_value_extent=color_value_extent,
