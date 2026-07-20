@@ -106,7 +106,7 @@ def test_cli_accepts_clear_text_cgm(tmp_path: Path) -> None:
     src = tmp_path / "in.cgm"
     out_dir = tmp_path / "out"
     src.write_text(
-        'VDCEXT 0 0 100 100; LINE 0 0 10 10; BEGAPS "SPOT"; '
+        'VDCEXT 0 0 100 100; LINE 0 0 10 10; BEGAPS "SPOT"; "'
         'APD "name" "ZONE"; APD "region" "1 2 3 4"; ENDAPS;',
         encoding="ascii",
     )
