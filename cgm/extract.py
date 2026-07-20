@@ -2095,6 +2095,7 @@ def _make_tile_array_record(
     tile_height: int,
     total_width: int,
     total_height: int,
+    cell_path: int = 0,
 ) -> dict[str, object]:
     return {
         "cols": max(1, cols),
@@ -2103,6 +2104,7 @@ def _make_tile_array_record(
         "tile_height": max(1, tile_height),
         "total_width": max(1, total_width),
         "total_height": max(1, total_height),
+        "cell_path": cell_path,
         "tiles": [],
     }
 
@@ -2117,6 +2119,7 @@ def _append_tile_record(
     family: str | None,
     local_color_precision: int | None = None,
     cell_representation_mode: int | None = None,
+    row_padding: int | None = None,
 ) -> None:
     tiles = array.get("tiles")
     if not isinstance(tiles, list):
@@ -2130,6 +2133,7 @@ def _append_tile_record(
             "family": family,
             "local_color_precision": local_color_precision,
             "cell_representation_mode": cell_representation_mode,
+            "row_padding": row_padding,
         }
     )
 
@@ -2148,6 +2152,7 @@ def _finalize_tile_array_record(
     total_w = _coerce_int(array.get("total_width", 1))
     total_h = _coerce_int(array.get("total_height", 1))
 
+    cell_path = _coerce_int(array.get("cell_path", 0))
     return _make_tile_array_record(
         cols=cols,
         rows=rows,
@@ -2155,6 +2160,7 @@ def _finalize_tile_array_record(
         tile_height=tile_h,
         total_width=total_w,
         total_height=total_h,
+        cell_path=cell_path,
     ) | {"tiles": tiles}
 
 
@@ -2257,6 +2263,8 @@ def _parse_text_tile_arrays(
         if command == "BEGTILEARRAY":
             numbers = _extract_text_numbers(statement)
             if len(numbers) >= 14:
+                # numbers[3] is CellPathDirection (0=right, 90=up, 180=left, 270=down)
+                cell_path = round(numbers[3])
                 cols = max(1, round(numbers[4]))
                 rows = max(1, round(numbers[5]))
                 tile_w = max(1, round(numbers[6]))
@@ -2264,7 +2272,7 @@ def _parse_text_tile_arrays(
                 total_w = max(1, round(numbers[-2]))
                 total_h = max(1, round(numbers[-1]))
             else:
-                cols, rows, tile_w, tile_h, total_w, total_h = 1, 1, 1, 1, 1, 1
+                cell_path, cols, rows, tile_w, tile_h, total_w, total_h = 0, 1, 1, 1, 1, 1, 1
 
             current = _make_tile_array_record(
                 cols=cols,
@@ -2273,6 +2281,7 @@ def _parse_text_tile_arrays(
                 tile_height=tile_h,
                 total_width=total_w,
                 total_height=total_h,
+                cell_path=cell_path,
             )
             continue
 
@@ -2282,7 +2291,16 @@ def _parse_text_tile_arrays(
                 metadata_prefix = statement.split("''", 1)[0].split('""', 1)[0]
                 numbers = _extract_text_numbers(metadata_prefix)
                 compression = round(numbers[0]) if numbers else None
-                local_color_precision = round(numbers[1]) if len(numbers) >= 2 else None
+                # For BITONALTILE/MONOCHROMETILE, position 1 is the row-padding
+                # indicator (bits of padding per row), not a colour precision.
+                # Only assign local_color_precision for colour tile commands.
+                _is_bitonal_cmd = command in {"BITONALTILE", "MONOCHROMETILE"}
+                # For bitonal/monochrome tiles, numbers[1] is the row-padding indicator
+                # (bits appended per compressed row for alignment), not colour precision.
+                row_padding = round(numbers[1]) if _is_bitonal_cmd and len(numbers) >= 2 else None
+                local_color_precision = (
+                    None if _is_bitonal_cmd else (round(numbers[1]) if len(numbers) >= 2 else None)
+                )
                 bit_order = round(numbers[2]) if len(numbers) >= 3 else None
                 orientation = round(numbers[3]) if len(numbers) >= 4 else None
                 cell_representation_mode = round(numbers[4]) if len(numbers) >= 5 else None
@@ -2295,6 +2313,7 @@ def _parse_text_tile_arrays(
                     family=_TEXT_TILE_COMMAND_FAMILY[command],
                     local_color_precision=local_color_precision,
                     cell_representation_mode=cell_representation_mode,
+                    row_padding=row_padding,
                 )
             continue
 
@@ -2319,6 +2338,7 @@ def _decode_bitonal_payload_to_image(
     *,
     compression: int | None = None,
     bit_order: int | None = None,
+    row_padding: int | None = None,
 ) -> Image.Image | None:
     image, _details = _decode_bitonal_payload_with_details(
         payload,
@@ -2326,6 +2346,7 @@ def _decode_bitonal_payload_to_image(
         height,
         compression=compression,
         bit_order=bit_order,
+        row_padding=row_padding,
     )
     return image
 
@@ -2342,6 +2363,7 @@ def _decode_tile_payload_to_image(
     cell_representation_mode: int | None = None,
     indexed_palette: bytes | None = None,
     color_value_extent: tuple[int, int, int, int, int, int] | None = None,
+    row_padding: int | None = None,
 ) -> Image.Image | None:
     """Decode tile payloads across bitonal and direct-color encodings."""
     if Image is None or width <= 0 or height <= 0:
@@ -2397,6 +2419,7 @@ def _decode_tile_payload_to_image(
         height,
         compression=compression,
         bit_order=bit_order,
+        row_padding=row_padding,
     )
     if image is not None:
         return image
@@ -2430,6 +2453,7 @@ def _decode_bitonal_payload_with_details(
     *,
     compression: int | None = None,
     bit_order: int | None = None,
+    row_padding: int | None = None,
     preferred_signature: tuple[str, str, bool] | None = None,
     preferred_dimensions: tuple[int, int] | None = None,
 ) -> tuple[Image.Image | None, dict[str, object]]:
@@ -2544,9 +2568,58 @@ def _decode_bitonal_payload_with_details(
         }
 
     if compression == 2:
-        try:
-            decoded = bytes(imagecodecs.ccittfax4_decode(payload, height=height, width=width))
-        except (RuntimeError, ValueError):
+        # T.6 (G4) rows may have alignment padding appended per the row_padding
+        # field.  imagecodecs treats the payload as a flat bitstream; padding bits
+        # are read as data, corrupting subsequent rows.  Compensate by trying up to
+        # three decode widths and keeping the one that produces the fewest
+        # all-black rows (a reliable proxy for T.6 misalignment artifacts).
+        _try_widths: list[int] = [width]
+        if isinstance(row_padding, int) and row_padding > 0:
+            _try_widths.append(width + row_padding)
+            if row_padding > 8:
+                _try_widths.append(width + row_padding // 2)
+        # Deduplicate while preserving order.
+        _seen_w: set[int] = set()
+        _unique_widths: list[int] = []
+        for _w in _try_widths:
+            if _w not in _seen_w:
+                _seen_w.add(_w)
+                _unique_widths.append(_w)
+
+        _best_img: Image.Image | None = None
+        _best_sbr: int = height + 1  # "solid-black-row" artifact count; lower is better
+
+        for _w in _unique_widths:
+            try:
+                _raw = bytes(imagecodecs.ccittfax4_decode(payload, height=height, width=_w))
+            except (RuntimeError, ValueError):
+                continue
+            # Strip the extra padding columns when we decoded at a wider width.
+            if _w > width:
+                _stripped = bytearray()
+                for _r in range(height):
+                    _stripped.extend(_raw[_r * _w : _r * _w + width])
+                _raw = bytes(_stripped)
+            _bits = _decode_fax_output_to_bitmap(_raw, width, height)
+            if _bits is None:
+                continue
+            # Count rows that are >95% black as a T.6 artifact score.
+            _sbr = sum(
+                1
+                for _r in range(height)
+                if sum(_bits[_r * width : (_r + 1) * width]) / width > 0.95
+            )
+            if _sbr < _best_sbr:
+                _best_sbr = _sbr
+                _best_img = Image.frombytes(
+                    "L",
+                    (width, height),
+                    bytes(0 if b else 255 for b in _bits),
+                )
+            if _best_sbr == 0:
+                break  # perfect decode found
+
+        if _best_img is None:
             return None, {
                 "best_score": None,
                 "candidate_count": 0,
@@ -2556,19 +2629,7 @@ def _decode_bitonal_payload_with_details(
                 "used_preferred_signature": False,
                 "attempts": [],
             }
-        decoded_bits = _decode_fax_output_to_bitmap(decoded, width, height)
-        if decoded_bits is None:
-            return None, {
-                "best_score": None,
-                "candidate_count": 0,
-                "best_candidate": None,
-                "preferred_signature": preferred_signature,
-                "preferred_dimensions": preferred_dimensions,
-                "used_preferred_signature": False,
-                "attempts": [],
-            }
-        pixels = bytes(0 if bit else 255 for bit in decoded_bits)
-        return Image.frombytes("L", (width, height), pixels), {
+        return _best_img, {
             "best_score": None,
             "candidate_count": 1,
             "best_candidate": {
@@ -2703,6 +2764,28 @@ def _coerce_int(value: object, default: int = 1) -> int:
     return default
 
 
+def _tile_row_col(tile_index: int, cols: int, rows: int, cell_path: int) -> tuple[int, int]:
+    """Map a flat tile index to (row, col) respecting CGM CellPath direction.
+
+    CellPath values:
+      0 / 360  right (row-major, left→right then top→bottom)
+      90       up   (column-major, bottom→top then left→right)
+      180      left (row-major, right→left then top→bottom)
+      270      down (column-major, top→bottom then left→right)
+    """
+    if cell_path in (90, 270):
+        # Column-major: tiles traverse rows within a column first.
+        col = tile_index // rows
+        row_in_col = tile_index % rows
+        row = (rows - 1 - row_in_col) if cell_path == 90 else row_in_col
+    else:
+        # Row-major (cell_path 0, 180, or default).
+        row = tile_index // cols
+        col_in_row = tile_index % cols
+        col = (cols - 1 - col_in_row) if cell_path == 180 else col_in_row
+    return row, col
+
+
 def _render_first_tile_array(
     data: bytes,
 ) -> Image.Image | None:
@@ -2719,6 +2802,7 @@ def _render_first_tile_array(
         tile_h_nominal = _coerce_int(array.get("tile_height", 1))
         total_w = _coerce_int(array.get("total_width", 1))
         total_h = _coerce_int(array.get("total_height", 1))
+        # cell_path = _coerce_int(array.get("cell_path", 0))
         tiles = array.get("tiles", [])
         if not isinstance(tiles, list) or not tiles:
             continue
@@ -2750,6 +2834,9 @@ def _render_first_tile_array(
                 else None,
                 cell_representation_mode=tile_payload.get("cell_representation_mode")
                 if isinstance(tile_payload.get("cell_representation_mode"), int)
+                else None,
+                row_padding=tile_payload.get("row_padding")
+                if isinstance(tile_payload.get("row_padding"), int)
                 else None,
                 indexed_palette=indexed_palette,
                 color_value_extent=color_value_extent,
@@ -2795,6 +2882,7 @@ def _render_first_tile_array_overlays(
         tile_h_nominal = _coerce_int(array.get("tile_height", 1))
         total_w = _coerce_int(array.get("total_width", 1))
         total_h = _coerce_int(array.get("total_height", 1))
+        # cell_path = _coerce_int(array.get("cell_path", 0))
         tiles = array.get("tiles", [])
         if not isinstance(tiles, list) or not tiles:
             continue
@@ -2825,6 +2913,9 @@ def _render_first_tile_array_overlays(
                 else None,
                 cell_representation_mode=tile_payload.get("cell_representation_mode")
                 if isinstance(tile_payload.get("cell_representation_mode"), int)
+                else None,
+                row_padding=tile_payload.get("row_padding")
+                if isinstance(tile_payload.get("row_padding"), int)
                 else None,
                 indexed_palette=indexed_palette,
                 color_value_extent=color_value_extent,
