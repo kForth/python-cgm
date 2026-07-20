@@ -455,7 +455,7 @@ def extract_hotspots_from_bytes(data: bytes) -> list[HotSpot]:
 
 
 def extract_hotspots(file_path: str | Path) -> list[HotSpot]:
-    """Extract hotspot regions from a binary CGM file path."""
+    """Extract hotspot regions from a CGM file path."""
     path = Path(file_path)
     raw = path.read_bytes()
     if log.isEnabledFor(logging.DEBUG):
@@ -735,113 +735,6 @@ def _filter_points_for_bounds(
     return filtered if filtered else points
 
 
-def _rebase_points_to_vdc_if_better(
-    points: list[tuple[float, float]],
-    *,
-    vdc_extent: tuple[float, float, float, float] | None,
-) -> list[tuple[float, float]]:
-    """Shift local-origin point sets into VDC space when clearly better."""
-    if not points or vdc_extent is None:
-        return points
-
-    min_x, min_y, max_x, max_y = vdc_extent
-    original_penalty = _point_penalty(points, vdc_extent=vdc_extent)
-    if original_penalty <= 0.0:
-        return points
-
-    shifts = [
-        (0.0, 0.0),
-        (min_x, min_y),
-        (min_x, max_y),
-        (max_x, min_y),
-        (max_x, max_y),
-        ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0),
-    ]
-
-    best_points = points
-    best_penalty = original_penalty
-    for dx, dy in shifts:
-        candidate = [(x + dx, y + dy) for x, y in points]
-        penalty = _point_penalty(candidate, vdc_extent=vdc_extent)
-        if penalty < best_penalty:
-            best_penalty = penalty
-            best_points = candidate
-
-    if best_penalty < (original_penalty * 0.7) and (original_penalty - best_penalty) >= 5.0:
-        return best_points
-    return points
-
-
-def _sanitize_points_within_vdc(
-    points: list[tuple[float, float]],
-    *,
-    vdc_extent: tuple[float, float, float, float] | None,
-) -> list[tuple[float, float]]:
-    """Drop implausible outlier vertices when a stable VDC envelope is known."""
-    if len(points) < 2 or vdc_extent is None:
-        return points
-
-    min_x, min_y, max_x, max_y = vdc_extent
-    span = max(1.0, max_x - min_x, max_y - min_y)
-    margin = span * 0.25
-    low_x = min_x - margin
-    high_x = max_x + margin
-    low_y = min_y - margin
-    high_y = max_y + margin
-
-    in_range = [(x, y) for x, y in points if (low_x <= x <= high_x) and (low_y <= y <= high_y)]
-    if len(in_range) < 2 or len(in_range) == len(points):
-        return points
-
-    original_penalty = _point_penalty(points, vdc_extent=vdc_extent)
-    sanitized_penalty = _point_penalty(in_range, vdc_extent=vdc_extent)
-    if sanitized_penalty + 5.0 <= original_penalty:
-        return in_range
-    return points
-
-
-def _extract_vdc_bounded_runs(
-    points: list[tuple[float, float]],
-    *,
-    vdc_extent: tuple[float, float, float, float] | None,
-    min_run_points: int = 3,
-    max_runs: int = 16,
-    max_points_per_run: int = 256,
-) -> list[list[tuple[float, float]]]:
-    """Split noisy point streams into plausible contiguous VDC-bounded runs."""
-    if len(points) < min_run_points:
-        return []
-    if vdc_extent is None:
-        return [points[:max_points_per_run]]
-
-    min_x, min_y, max_x, max_y = vdc_extent
-    span = max(1.0, max_x - min_x, max_y - min_y)
-    margin = span * 0.25
-    low_x = min_x - margin
-    high_x = max_x + margin
-    low_y = min_y - margin
-    high_y = max_y + margin
-
-    runs: list[list[tuple[float, float]]] = []
-    current: list[tuple[float, float]] = []
-
-    for x, y in points:
-        if low_x <= x <= high_x and low_y <= y <= high_y:
-            current.append((x, y))
-            continue
-
-        if len(current) >= min_run_points:
-            runs.append(current[:max_points_per_run])
-            if len(runs) >= max_runs:
-                return runs
-        current = []
-
-    if len(current) >= min_run_points and len(runs) < max_runs:
-        runs.append(current[:max_points_per_run])
-
-    return runs
-
-
 def _decode_i16_be(value: bytes) -> int | None:
     if len(value) != 2:
         return None
@@ -899,43 +792,6 @@ def _decode_point_pairs_from_profile(
 
     # Unknown VDC descriptor profile: do not guess mixed encodings.
     return []
-
-
-def _point_penalty(
-    points: list[tuple[float, float]],
-    *,
-    vdc_extent: tuple[float, float, float, float] | None,
-) -> float:
-    if not points:
-        return 1e9
-
-    if vdc_extent is None:
-        penalty = 0.0
-        for x, y in points:
-            if abs(x) > 5_000_000 or abs(y) > 5_000_000:
-                penalty += 25.0
-            if abs(x) > 50_000_000 or abs(y) > 50_000_000:
-                penalty += 250.0
-        return penalty
-
-    min_x, min_y, max_x, max_y = vdc_extent
-    span = max(1.0, max_x - min_x, max_y - min_y)
-    margin = span * 0.25
-    low_x = min_x - margin
-    high_x = max_x + margin
-    low_y = min_y - margin
-    high_y = max_y + margin
-
-    penalty = 0.0
-    for x, y in points:
-        if x < low_x or x > high_x or y < low_y or y > high_y:
-            penalty += 5.0
-        if x < (min_x - span * 10.0) or x > (max_x + span * 10.0):
-            penalty += 50.0
-        if y < (min_y - span * 10.0) or y > (max_y + span * 10.0):
-            penalty += 50.0
-
-    return penalty
 
 
 def _decode_vdc_extent(parameters: bytes) -> tuple[float, float, float, float] | None:
@@ -1260,24 +1116,6 @@ def _decode_fax_output_to_bitmap(output: bytes, width: int, height: int) -> list
             bit = (byte_value >> (7 - (x % 8))) & 1
             bits.append(bit)
     return bits
-
-
-def _bitmap_to_png_data_uri(bits: list[int], width: int, height: int) -> str | None:
-    """Encode a 0/1 bitmap to a PNG data URI if Pillow is available."""
-
-    if Image is None:
-        return None
-
-    if len(bits) != width * height:
-        return None
-
-    # Render black lines on white background (user screenshot indicates possible inversion).
-    pixels = bytes(0 if bit else 255 for bit in bits)
-    image = Image.frombytes("L", (width, height), pixels)
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    payload = base64.b64encode(buffer.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{payload}"
 
 
 def _image_to_png_data_uri(image: Image.Image | None) -> str | None:
@@ -1924,7 +1762,7 @@ def extract_raw_images_from_bytes(data: bytes) -> list[RawImage]:
 
 
 def extract_raw_images(file_path: str | Path) -> list[RawImage]:
-    """Extract raw images from a binary CGM file path."""
+    """Extract raw images from a CGM file path."""
     path = Path(file_path)
     raw = path.read_bytes()
     if log.isEnabledFor(logging.DEBUG):
@@ -2044,14 +1882,6 @@ def _extract_hex_payload(statement: str) -> bytes:
         return b""
 
 
-def _tile_axis_sizes(total: int, count: int) -> list[int]:
-    if count <= 0:
-        return []
-    base = max(1, total // count)
-    remainder = max(0, total - (base * count))
-    return [base + (1 if idx < remainder else 0) for idx in range(count)]
-
-
 def _infer_tile_grid(tile_count: int, total_w: int, total_h: int) -> tuple[int, int]:
     if tile_count <= 1:
         return 1, 1
@@ -2162,78 +1992,6 @@ def _finalize_tile_array_record(
         total_height=total_h,
         cell_path=cell_path,
     ) | {"tiles": tiles}
-
-
-def _parse_binary_tile_arrays(
-    data: bytes,
-) -> list[dict[str, object]]:
-    """Synthesize tile-array metadata from binary Cell Array sequences."""
-    array = _make_tile_array_record(
-        cols=1,
-        rows=1,
-        tile_width=1,
-        tile_height=1,
-        total_width=1,
-        total_height=1,
-    )
-    common_total_w: int | None = None
-    common_total_h: int | None = None
-    tile_count = 0
-
-    for element in iter_elements(data):
-        if element.class_id != CELL_ARRAY_CLASS_ID or element.element_id != CELL_ARRAY_ELEMENT_ID:
-            continue
-
-        metadata = _parse_cell_array_metadata(element.parameters)
-        width = metadata["width"] if isinstance(metadata["width"], int) else None
-        height = metadata["height"] if isinstance(metadata["height"], int) else None
-        payload_offset = (
-            metadata["payload_offset"] if isinstance(metadata["payload_offset"], int) else 0
-        )
-        payload = (
-            element.parameters[payload_offset:] if payload_offset < len(element.parameters) else b""
-        )
-        if not payload:
-            continue
-
-        if width is not None and width > 0:
-            common_total_w = width if common_total_w is None else common_total_w
-        if height is not None and height > 0:
-            common_total_h = height if common_total_h is None else common_total_h
-
-        _append_tile_record(
-            array,
-            payload=bytes(payload),
-            compression=None,
-            bit_order=None,
-            orientation=None,
-            family=None,
-            local_color_precision=metadata["local_color_precision"]
-            if isinstance(metadata["local_color_precision"], int)
-            else None,
-            cell_representation_mode=metadata["cell_representation_mode"]
-            if isinstance(metadata["cell_representation_mode"], int)
-            else None,
-        )
-        tile_count += 1
-
-    if tile_count == 0:
-        return []
-
-    total_w = common_total_w if isinstance(common_total_w, int) and common_total_w > 0 else 1
-    total_h = common_total_h if isinstance(common_total_h, int) and common_total_h > 0 else 1
-    cols, rows = _infer_tile_grid(tile_count, total_w, total_h)
-    tile_w = max(1, total_w // max(1, cols))
-    tile_h = max(1, total_h // max(1, rows))
-    array["cols"] = cols
-    array["rows"] = rows
-    array["tile_width"] = tile_w
-    array["tile_height"] = tile_h
-    array["total_width"] = total_w
-    array["total_height"] = total_h
-
-    finalized = _finalize_tile_array_record(array)
-    return [finalized] if finalized is not None else []
 
 
 def _parse_tile_arrays(
@@ -2451,7 +2209,7 @@ def _decode_tile_payload_to_image(
     return None
 
 
-def _apply_tile_orientation(image: Image.Image, orientation: int | None) -> Image.Image:
+def _apply_tile_orientation(image: Image.Image, _orientation: int | None) -> Image.Image:
     """Apply CGM BITONALTILE orientation transform to a decoded tile image.
 
     Currently a no-op — the orientation field is stored in the tile record but
@@ -2895,28 +2653,6 @@ def _coerce_int(value: object, default: int = 1) -> int:
         except ValueError:
             return default
     return default
-
-
-def _tile_row_col(tile_index: int, cols: int, rows: int, cell_path: int) -> tuple[int, int]:
-    """Map a flat tile index to (row, col) respecting CGM CellPath direction.
-
-    CellPath values:
-      0 / 360  right (row-major, left→right then top→bottom)
-      90       up   (column-major, bottom→top then left→right)
-      180      left (row-major, right→left then top→bottom)
-      270      down (column-major, top→bottom then left→right)
-    """
-    if cell_path in (90, 270):
-        # Column-major: tiles traverse rows within a column first.
-        col = tile_index // rows
-        row_in_col = tile_index % rows
-        row = (rows - 1 - row_in_col) if cell_path == 90 else row_in_col
-    else:
-        # Row-major (cell_path 0, 180, or default).
-        row = tile_index // cols
-        col_in_row = tile_index % cols
-        col = (cols - 1 - col_in_row) if cell_path == 180 else col_in_row
-    return row, col
 
 
 def _render_first_tile_array(
