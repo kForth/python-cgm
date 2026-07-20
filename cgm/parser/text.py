@@ -1,200 +1,26 @@
-"""Low-level parser for binary and clear-text CGM files (ISO/IEC 8632)."""
+"""Clear-text CGM command parsing and mapping."""
 
 from __future__ import annotations
-
-__author__ = "Kestin Goforth"
-__copyright__ = "Copyright 2026"
-__license__ = "BSD-3-Clause"
 
 import logging
 import re
 import struct
 from typing import TYPE_CHECKING
 
-from .errors import CGMParseError
-from .types import CGMElement
+from cgm.parser.constants import _TEXT_TILE_COMMANDS, CELL_ARRAY_CLASS_ID, CELL_ARRAY_ELEMENT_ID
+from cgm.types import CGMElement
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-
-LONG_FORM_SENTINEL = 0x1F
-
-
-# Class 4, Element 9 is Cell Array (raster data carrier in CGM).
-CELL_ARRAY_CLASS_ID = 4
-CELL_ARRAY_ELEMENT_ID = 9
-
-_TEXT_TILE_COMMANDS = {
-    "BITONALTILE",
-    "COLORTILE",
-    "COLOURTILE",
-    "DIRECTCOLORTILE",
-    "DIRECTCOLOURTILE",
-    "INDEXCOLORTILE",
-    "INDEXCOLOURTILE",
-    "MONOCHROMETILE",
-}
-
 log = logging.getLogger("cgm.parser")
 
-
-def _read_u16_be(data: bytes, offset: int) -> int:
-    if offset + 2 > len(data):
-        raise CGMParseError("Unexpected end-of-file while reading 16-bit value")
-    return int.from_bytes(data[offset : offset + 2], "big")
+_NUMBER_RE = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
+_QUOTED_RE = re.compile(r'"([^\"]*)"|\'([^\']*)\'')
+_HEX_RUN_RE = re.compile(r"[0-9A-Fa-f]{32,}")
 
 
-def _read_parameter_block(data: bytes, offset: int, declared_length: int) -> tuple[bytes, int]:
-    """Read either short-form or long-form CGM element parameters."""
-    if declared_length != LONG_FORM_SENTINEL:
-        end = offset + declared_length
-        if end > len(data):
-            raise CGMParseError("Unexpected end-of-file in short-form element parameters")
-
-        params = data[offset:end]
-        next_offset = end + (declared_length & 1)
-        if log.isEnabledFor(logging.DEBUG):
-            log.debug(
-                "Short-form params: start=%d length=%d padded=%s next=%d",
-                offset,
-                declared_length,
-                bool(declared_length & 1),
-                next_offset,
-            )
-        return params, next_offset
-
-    chunks: list[bytes] = []
-    cursor = offset
-    if log.isEnabledFor(logging.DEBUG):
-        log.debug("Long-form params: start=%d", offset)
-
-    while True:
-        part_header = _read_u16_be(data, cursor)
-        cursor += 2
-
-        has_more = bool(part_header & 0x8000)
-        part_length = part_header & 0x7FFF
-
-        end = cursor + part_length
-        if end > len(data):
-            raise CGMParseError("Unexpected end-of-file in long-form element parameters")
-
-        if log.isEnabledFor(logging.DEBUG):
-            log.debug(
-                "Long-form chunk: cursor=%d length=%d has_more=%s",
-                cursor,
-                part_length,
-                has_more,
-            )
-
-        chunks.append(data[cursor:end])
-        cursor = end
-
-        if part_length & 1:
-            cursor += 1
-
-        if not has_more:
-            break
-
-    params = b"".join(chunks)
-    if log.isEnabledFor(logging.DEBUG):
-        log.debug("Long-form params complete: total_length=%d next=%d", len(params), cursor)
-    return params, cursor
-
-
-def _iter_binary_elements(data: bytes) -> Iterator[CGMElement]:
-    """Yield parsed elements from a binary CGM byte stream."""
-    offset = 0
-    size = len(data)
-
-    if log.isEnabledFor(logging.DEBUG):
-        log.debug("Begin binary element iteration: stream_size=%d", size)
-
-    while offset < size:
-        element_offset = offset
-        header = _read_u16_be(data, offset)
-        offset += 2
-
-        class_id = (header >> 12) & 0x0F
-        element_id = (header >> 5) & 0x7F
-        declared_length = header & 0x1F
-
-        parameters, offset = _read_parameter_block(data, offset, declared_length)
-
-        if log.isEnabledFor(logging.DEBUG):
-            log.debug(
-                (
-                    "Element parsed: offset=%d class=%d id=%d declared_length=%d "
-                    "actual_params=%d next_offset=%d"
-                ),
-                element_offset,
-                class_id,
-                element_id,
-                declared_length,
-                len(parameters),
-                offset,
-            )
-
-        yield CGMElement(
-            class_id=class_id,
-            element_id=element_id,
-            parameters=parameters,
-            offset=element_offset,
-        )
-
-
-def _looks_like_text_cgm(data: bytes) -> bool:
-    if not data:
-        return False
-
-    head = data[:512]
-    if b"\x00" in head:
-        return False
-
-    # Treat streams with many control bytes as binary.
-    control_bytes = sum(byte < 9 or (13 < byte < 32) for byte in head)
-    if control_bytes > max(4, len(head) // 20):
-        return False
-
-    try:
-        sample = head.decode("ascii")
-    except UnicodeDecodeError:
-        return False
-
-    upper = sample.upper()
-    if ";" not in upper:
-        return False
-
-    keywords = (
-        "BEGMF",
-        "LINE",
-        "POLYGON",
-        "TEXT",
-        "TRANSPARENCY",
-        "TRANSPARENCYMODE",
-        "CLIPRECT",
-        "CLIPIND",
-        "COLRVALUEEXT",
-        "COLORVALUEEXTENT",
-        "CELLARRAY",
-        "BEGTILEARRAY",
-        "BITONALTILE",
-        "COLORTILE",
-        "COLOURTILE",
-        "DIRECTCOLORTILE",
-        "DIRECTCOLOURTILE",
-        "INDEXCOLORTILE",
-        "INDEXCOLOURTILE",
-        "MONOCHROMETILE",
-        "APD",
-        "BEGAPS",
-        "ENDAPS",
-    )
-    return any(token in upper for token in keywords)
-
-
-def _split_text_commands(text: str) -> Iterator[tuple[int, str]]:
+def split_text_commands(text: str) -> Iterator[tuple[int, str]]:
     start = 0
     in_quote = False
     quote_char = ""
@@ -218,10 +44,6 @@ def _split_text_commands(text: str) -> Iterator[tuple[int, str]]:
     tail = text[start:].strip()
     if tail:
         yield start, tail
-
-
-_NUMBER_RE = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
-_QUOTED_RE = re.compile(r"\"([^\"]*)\"|'([^']*)'")
 
 
 def _extract_numbers(statement: str) -> list[float]:
@@ -290,13 +112,8 @@ def _default_tile_local_color_precision(command: str) -> int:
     return 1
 
 
-_HEX_RUN_RE = re.compile(r"[0-9A-Fa-f]{32,}")
-
-
 def _extract_hex_payload(statement: str) -> bytes:
     """Extract large hexadecimal runs from a text statement and decode to bytes."""
-    # Tile commands commonly delimit payload with empty quotes (''), followed
-    # by one or more wrapped hex chunks. Join all chunks after that marker.
     tail = statement
     for marker in ("''", '""'):
         idx = tail.find(marker)
@@ -316,8 +133,6 @@ def _extract_hex_payload(statement: str) -> bytes:
                 pass
 
     words = statement.split()
-    # Tile payloads are commonly the final token. Accept short payloads too
-    # (for example 2-byte indexed tiles: "0001").
     tokens: list[str] = []
     for token in words:
         candidate = token.strip().strip("'\",()")
@@ -443,16 +258,17 @@ def _map_text_command(statement: str) -> tuple[int, int, bytes] | None:
     if command in {"ARC3PT", "CIRCULARARC3POINT", "CIRCULARARC3PT"} and len(numbers) >= 6:
         return 4, 13, _pack_f32_values(numbers[:6])
 
-    if command in {"ARC3PTCLOSE", "CIRCULARARC3POINTCLOSE", "CIRCULARARC3PTCLOSE"}:
-        if len(numbers) >= 6:
-            return 4, 14, _pack_f32_values(numbers[:6])
+    if (
+        command in {"ARC3PTCLOSE", "CIRCULARARC3POINTCLOSE", "CIRCULARARC3PTCLOSE"}
+        and len(numbers) >= 6
+    ):
+        return 4, 14, _pack_f32_values(numbers[:6])
 
     if command in {"ARCCENTRE", "ARCCTR", "CIRCULARARCCENTRE"} and len(numbers) >= 6:
         return 4, 15, _pack_f32_values(numbers[:6])
 
-    if command in {"ARCCENTRECLOSE", "ARCCTRCLOSE", "CIRCULARARCCENTRECLOSE"}:
-        if len(numbers) >= 6:
-            return 4, 16, _pack_f32_values(numbers[:6])
+    if command in {"ARCCENTRECLOSE", "ARCCTRCLOSE", "CIRCULARARCCENTRECLOSE"} and len(numbers) >= 6:
+        return 4, 16, _pack_f32_values(numbers[:6])
 
     if command == "ELLIPSE" and len(numbers) >= 6:
         return 4, 17, _pack_f32_values(numbers[:6])
@@ -533,7 +349,6 @@ def _map_text_command(statement: str) -> tuple[int, int, bytes] | None:
             key = strings[0]
             value_text = strings[1]
         else:
-            # Fallback: APD key value
             bare = [token.strip(",()") for token in words[1:] if token.strip(",()")]
             if len(bare) < 2:
                 return None
@@ -556,21 +371,17 @@ def _map_text_command(statement: str) -> tuple[int, int, bytes] | None:
     return None
 
 
-def _iter_text_elements(data: bytes) -> Iterator[CGMElement]:
+def iter_text_elements(data: bytes) -> Iterator[CGMElement]:
     """Yield parsed elements from clear-text CGM command streams."""
     text = data.decode("latin-1")
-    # Some clear-text writers emit an accidental quote right before a command
-    # token (for example: ; "APD ...). Remove that marker so splitting by
-    # semicolon does not get stuck in an unmatched quoted region.
     text = re.sub(r"(^|;)\s*[\"'](?=[A-Za-z])", r"\1 ", text)
     tile_dims: tuple[int | None, int | None] = (None, None)
 
     if log.isEnabledFor(logging.DEBUG):
         log.debug("Begin clear-text element iteration: stream_size=%d", len(data))
 
-    for command_offset, statement in _split_text_commands(text):
+    for command_offset, statement in split_text_commands(text):
         normalized_statement = statement.lstrip()
-        # Some clear-text streams contain a stray leading quote before a command.
         while normalized_statement.startswith(('"', "'")):
             normalized_statement = normalized_statement[1:].lstrip()
 
@@ -626,12 +437,3 @@ def _iter_text_elements(data: bytes) -> Iterator[CGMElement]:
             parameters=parameters,
             offset=command_offset,
         )
-
-
-def iter_elements(data: bytes) -> Iterator[CGMElement]:
-    """Yield parsed elements from either binary or clear-text CGM streams."""
-    if _looks_like_text_cgm(data):
-        yield from _iter_text_elements(data)
-        return
-
-    yield from _iter_binary_elements(data)

@@ -197,7 +197,7 @@ and clear-text CGM workflows.
 - This project is extraction-oriented: it parses and exports data/SVG/JSON, but does **not** support CGM authoring or round-trip editing.
 - Rendering is best-effort for many real-world files; unsupported or profile-specific constructs may be skipped rather than heuristically rewritten.
 - Raster composition is metadata-dependent. Clear-text tile arrays are composed directly; binary Cell Array payloads are extracted and used as raster candidates.
-- Certain raster decode paths require optional runtime dependencies (`Pillow`, `imagecodecs`). Without them, raw extraction still works but image rendering coverage is reduced.
+- Raster decoding requires runtime dependencies `Pillow` and `imagecodecs` (installed with this package by default).
 - JSON exports can be large because they include full element parameter and payload hex data.
 
 ## License

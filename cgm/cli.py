@@ -11,7 +11,7 @@ from pathlib import Path
 
 import click
 
-from .extract import (
+from cgm.extract import (
     extract_hotspots_to_directory,
     extract_rendered_images_to_directory,
 )
