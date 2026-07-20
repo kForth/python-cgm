@@ -11,12 +11,13 @@
 
 
 Read-only Python tools for parsing binary and clear-text CGM (ISO/IEC 8632) files,
-producing a single final SVG image output (with optional embedded raster background),
-and extracting hotspot metadata as JSON.
+producing final SVG output with optional raster tile backgrounds, and extracting
+hotspot metadata as JSON.
 
 This package focuses on practical CGM extraction workflows: parsing CGM content,
-extracting image-bearing `Cell Array` payloads, composing raster+vector SVG output,
-and recovering hotspots from both APD region properties and APS geometry fallback.
+extracting image-bearing `Cell Array` payloads, decoding clear-text tile arrays,
+composing raster+vector SVG output, and recovering hotspots from APD region
+properties and APS geometry fallback.
 It does not support writing CGM files.
 
 ## Installation
@@ -30,13 +31,12 @@ pip install python-cgm
 ## What It Does
 
 - Parses binary and clear-text CGM command streams.
-- Finds `Cell Array` elements (class 4, element 9).
-- Extracts raw payload bytes from each image-bearing element.
+- Finds `Cell Array` elements (class 4, element 9) and extracts their raw payload bytes.
+- Decodes clear-text tiled bitonal, indexed, and direct-color arrays.
 - Builds a final SVG output that can include an embedded raster background.
-- Stitches/decodes clear-text tiled bitonal arrays for SVG background composition.
-- Converts vector-like CGM drawing primitives into a best-effort SVG overlay.
-- Extracts hotspots from APD `name`/`region` and APS geometry groups (for files such as GR-77775).
-- Exports parsed element data, payload metadata, and embedded SVG as JSON.
+- Converts vector-like CGM drawing primitives into SVG overlays.
+- Extracts hotspots from APD `name`/`region` records and APS geometry groups.
+- Exports parsed element data, payload metadata, rendered SVG, and hotspots as JSON.
 
 ## Quick Start
 
@@ -107,6 +107,7 @@ cgm-extract file.cgm ./out --debug
 - `extract_raw_images(file_path) -> list[RawImage]`
 - `extract_raw_images_from_bytes(data) -> list[RawImage]`
 - `extract_raw_images_to_directory(file_path, output_dir, stem="image") -> list[Path]`
+- `extract_rendered_images_to_directory(file_path, output_dir, stem="image", debug_report=False) -> list[Path]`
 - `extract_vector_svg(file_path) -> str`
 - `extract_vector_svg_from_bytes(data) -> str`
 - `extract_vector_svg_to_directory(file_path, output_dir, stem="image") -> Path`
@@ -117,21 +118,22 @@ cgm-extract file.cgm ./out --debug
 - `extract_hotspots_from_bytes(data) -> list[HotSpot]`
 - `extract_hotspots_to_directory(file_path, output_dir, stem="image") -> Path`
 - `extract_final_image_and_hotspots(file_path) -> dict[str, object]`
-- `extract_rendered_images_to_directory(file_path, output_dir, stem="image", debug_report=False) -> list[Path]`
 
 `RawImage` fields:
 
 - `index`: zero-based image index.
 - `element_offset`: byte offset of the CGM element in the source file.
 - `payload`: raw image payload bytes.
-- `width` / `height`: best-effort dimensions when present in common binary layouts.
+- `width` / `height`: dimensions when present in common binary or clear-text tile layouts.
+- `local_color_precision`: declared color precision for the payload when available.
+- `cell_representation_mode`: declared cell representation mode when available.
 
 ## Scope And Limitations
 
 - Supports binary and clear-text CGM streams used by this project.
-- Raster decoding/composition is best effort and depends on payload encoding patterns.
-- SVG output is **best effort** and depends on CGM command patterns in the file.
-- Hotspot extraction is best effort and supports APD region records plus APS geometry fallback.
+- Raster decoding/composition depends on the declared CGM payload encoding and tile metadata.
+- SVG output covers the supported CGM command patterns in the file.
+- Hotspot extraction supports APD region records plus APS geometry fallback.
 - JSON output can be large because it includes full element parameter/payload hex data.
 - Does **not** support CGM writing.
 

@@ -1,4 +1,4 @@
-"""High-level CGM extraction helpers for SVG composition and hotspot recovery."""
+"""High-level CGM extraction helpers for SVG, tile/raster decoding, and hotspot recovery."""
 
 from __future__ import annotations
 
@@ -43,15 +43,6 @@ def _reverse_bits_in_byte(value: int) -> int:
     value = ((value & 0xCC) >> 2) | ((value & 0x33) << 2)
     value = ((value & 0xAA) >> 1) | ((value & 0x55) << 1)
     return value
-
-
-def _payload_variants(payload: bytes) -> list[bytes]:
-    """Return unique encoded payload variants used for decode attempts."""
-    variants = [payload]
-    reversed_bits = bytes(_reverse_bits_in_byte(byte) for byte in payload)
-    if reversed_bits != payload:
-        variants.append(reversed_bits)
-    return variants
 
 
 def _candidate_signature(candidate: dict[str, object] | None) -> tuple[str, str, bool] | None:
@@ -113,7 +104,7 @@ def _choose_consensus_decode_dimensions(
 
 
 def _parse_cell_array_hints(parameters: bytes) -> tuple[int | None, int | None, int]:
-    """Best-effort parse of common Cell Array metadata for binary CGM streams.
+    """Parse common Cell Array metadata for binary CGM streams when the layout matches.
 
     Many CGM files use 16-bit integer VDC coordinates and 16-bit dimensions.
     When this layout is present, this function returns width/height and payload
@@ -150,17 +141,97 @@ def _parse_cell_array_hints(parameters: bytes) -> tuple[int | None, int | None, 
     return nx, ny, base
 
 
+def _parse_cell_array_metadata(parameters: bytes) -> dict[str, int | None]:
+    """Parse common binary Cell Array metadata in a safe, profile-agnostic way."""
+    width, height, payload_offset = _parse_cell_array_hints(parameters)
+    if len(parameters) >= 20:
+        local_color_precision = int.from_bytes(parameters[16:18], "big", signed=False)
+        cell_representation_mode = int.from_bytes(parameters[18:20], "big", signed=False)
+    else:
+        local_color_precision = None
+        cell_representation_mode = None
+
+    return {
+        "width": width,
+        "height": height,
+        "payload_offset": payload_offset,
+        "local_color_precision": local_color_precision,
+        "cell_representation_mode": cell_representation_mode,
+    }
+
+
 @dataclass(slots=True)
 class _SvgStyle:
     stroke_color: str = "#000000"
     stroke_width: float = 1.0
     font_size: float = 10.0
+    marker_size: float = 2.0
+
+
+@dataclass(slots=True)
+class _CgmDescriptorProfile:
+    vdc_type: int | None = None
+    vdc_integer_precision: int | None = None
+    vdc_real_precision_bits: int | None = None
+
+
+def _extract_descriptor_profile(data: bytes) -> _CgmDescriptorProfile:
+    """Extract a minimal CGM descriptor profile used for strict coordinate decode."""
+
+    profile = _CgmDescriptorProfile()
+    for element in iter_elements(data):
+        if element.class_id != 1:
+            continue
+
+        if element.element_id == 3:
+            # VDC type: INTEGER=0, REAL=1 in common profiles.
+            if len(element.parameters) >= 2:
+                profile.vdc_type = int.from_bytes(element.parameters[:2], "big", signed=False)
+            elif element.parameters:
+                profile.vdc_type = int(element.parameters[0])
+            continue
+
+        if element.element_id == 11:
+            # VDC integer precision in bits.
+            if len(element.parameters) >= 2:
+                profile.vdc_integer_precision = int.from_bytes(
+                    element.parameters[:2],
+                    "big",
+                    signed=False,
+                )
+            continue
+
+        if element.element_id == 12:
+            # VDC real precision descriptors vary by profile; keep a compact
+            # hint for common IEEE-like 32/64-bit paths.
+            if len(element.parameters) >= 2:
+                head = int.from_bytes(element.parameters[:2], "big", signed=False)
+                if head in (32, 64):
+                    profile.vdc_real_precision_bits = head
+                elif len(element.parameters) >= 6:
+                    mantissa_bits = int.from_bytes(element.parameters[4:6], "big", signed=False)
+                    if mantissa_bits >= 52:
+                        profile.vdc_real_precision_bits = 64
+                    elif mantissa_bits >= 23:
+                        profile.vdc_real_precision_bits = 32
+            continue
+
+    return profile
 
 
 def _parse_f32_be(value: bytes) -> float | None:
     if len(value) != 4:
         return None
     parsed = float(struct.unpack(">f", value)[0])
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _parse_f64_be(value: bytes) -> float | None:
+    if len(value) != 8:
+        return None
+    parsed = float(struct.unpack(">d", value)[0])
     if not math.isfinite(parsed):
         return None
     return parsed
@@ -173,27 +244,17 @@ def _decode_point_pairs_exact(parameters: bytes) -> list[tuple[float, float]]:
         y = _parse_f32_be(parameters[offset + 4 : offset + 8])
         if x is None or y is None:
             continue
-        if abs(x) > 1_000_000 or abs(y) > 1_000_000:
-            continue
         points.append((x, y))
     return points
 
 
-def _decode_point_pairs_heuristic(parameters: bytes) -> list[tuple[float, float]]:
-    best: list[tuple[float, float]] = []
-    for start in range(8):
-        points: list[tuple[float, float]] = []
-        for offset in range(start, len(parameters) - 7, 8):
-            x = _parse_f32_be(parameters[offset : offset + 4])
-            y = _parse_f32_be(parameters[offset + 4 : offset + 8])
-            if x is None or y is None:
-                continue
-            if abs(x) > 10_000 or abs(y) > 10_000:
-                continue
-            points.append((x, y))
-        if len(points) > len(best):
-            best = points
-    return best
+def _decode_point_pairs_i32(parameters: bytes) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for offset in range(0, len(parameters) - 7, 8):
+        x = int.from_bytes(parameters[offset : offset + 4], "big", signed=True)
+        y = int.from_bytes(parameters[offset + 4 : offset + 8], "big", signed=True)
+        points.append((float(x), float(y)))
+    return points
 
 
 def _decode_cgm_text(parameters: bytes) -> str | None:
@@ -258,7 +319,7 @@ def _decode_application_property(parameters: bytes) -> tuple[str, bytes] | None:
 
 
 def _decode_hotspot_region_bbox(value: bytes) -> tuple[int, int, int, int] | None:
-    """Extract a best-effort rectangular region from hotspot payload bytes."""
+    """Extract a rectangular region from hotspot payload bytes when one is present."""
     if len(value) < 8:
         return None
     x_min = int.from_bytes(value[-8:-6], "big", signed=False)
@@ -271,7 +332,7 @@ def _decode_hotspot_region_bbox(value: bytes) -> tuple[int, int, int, int] | Non
 
 
 def extract_hotspots_from_bytes(data: bytes) -> list[HotSpot]:
-    """Extract best-effort hotspot regions from application data elements."""
+    """Extract hotspot regions from APD application data and APS geometry elements."""
     hotspots: list[HotSpot] = []
 
     context_stack: list[dict[str, object]] = []
@@ -370,10 +431,10 @@ def extract_hotspots_from_bytes(data: bytes) -> list[HotSpot]:
                 for x, y in _decode_point_pairs_exact(element.parameters):
                     _update_geom_bbox(context, x, y)
             elif element.element_id == 5 and len(element.parameters) >= 8:
-                x = _parse_f32_be(element.parameters[0:4])
-                y = _parse_f32_be(element.parameters[4:8])
-                if x is not None and y is not None:
-                    _update_geom_bbox(context, x, y)
+                x_val = _parse_f32_be(element.parameters[0:4])
+                y_val = _parse_f32_be(element.parameters[4:8])
+                if x_val is not None and y_val is not None:
+                    _update_geom_bbox(context, x_val, y_val)
             elif element.element_id == 29:
                 restricted = _decode_restricted_text(element.parameters)
                 if restricted is not None:
@@ -437,7 +498,8 @@ def extract_final_image_and_hotspots(
 ) -> dict[str, object]:
     """Return the final image as SVG text and hotspot dictionaries.
 
-    The returned SVG may contain an embedded PNG image when raster fallback is used.
+    The returned SVG may contain an embedded raster background when tile or Cell Array
+    data is available.
     """
 
     path = Path(file_path)
@@ -462,23 +524,588 @@ def extract_final_image_and_hotspots(
     }
 
 
-def _palette_index_to_hex(color_index: int) -> str:
-    palette = {
-        0: "#000000",
-        1: "#ffffff",
-        2: "#000000",
-        3: "#2f2f2f",
-        4: "#404040",
-        5: "#606060",
-        6: "#808080",
-        7: "#a0a0a0",
+def _default_palette_entry(color_index: int) -> tuple[int, int, int]:
+    defaults = {
+        0: (0, 0, 0),
+        1: (255, 255, 255),
+        2: (0, 0, 0),
+        3: (47, 47, 47),
+        4: (64, 64, 64),
+        5: (96, 96, 96),
+        6: (128, 128, 128),
+        7: (160, 160, 160),
     }
-    return palette.get(color_index, "#000000")
+    if color_index in defaults:
+        return defaults[color_index]
+    gray = max(0, min(255, color_index))
+    return gray, gray, gray
 
 
-def _format_points(points: list[tuple[float, float]], *, min_y: float, max_y: float) -> str:
-    mapped = (f"{x:.3f},{(max_y - (y - min_y)):.3f}" for x, y in points)
+def _palette_index_to_hex(
+    color_index: int,
+    *,
+    color_table: dict[int, tuple[int, int, int]] | None = None,
+) -> str:
+    rgb = (color_table or {}).get(color_index, _default_palette_entry(color_index))
+    return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+
+
+def _decode_transparency_mode(parameters: bytes) -> bool | None:
+    """Return transparency mode (True=on, False=off) when decodable."""
+    if not parameters:
+        return None
+    if len(parameters) >= 2:
+        value = int.from_bytes(parameters[:2], "big", signed=False)
+    else:
+        value = parameters[0]
+    return value != 0
+
+
+def _decode_clip_indicator(parameters: bytes) -> bool | None:
+    """Return clip indicator (True=on, False=off) when decodable."""
+    if not parameters:
+        return None
+    if len(parameters) >= 2:
+        value = int.from_bytes(parameters[:2], "big", signed=False)
+    else:
+        value = parameters[0]
+    return value != 0
+
+
+def _decode_color_table_parameters(parameters: bytes) -> dict[int, tuple[int, int, int]]:
+    """Decode class-5/id-34 Color Table entries across common precisions."""
+    if len(parameters) < 4:
+        return {}
+    table: dict[int, tuple[int, int, int]] = {}
+
+    # Decode candidate layouts and merge; higher component precision decodes
+    # override lower-precision ambiguities for overlapping indices.
+    for component_bytes in (1, 2):
+        entry_size = component_bytes * 3
+        for offset in (1, 2):
+            if len(parameters) <= offset:
+                continue
+            remaining = len(parameters) - offset
+            if remaining < entry_size or (remaining % entry_size) != 0:
+                continue
+
+            start_index = int.from_bytes(parameters[:offset], "big", signed=False)
+            entries = remaining // entry_size
+            cursor = offset
+            for entry_idx in range(entries):
+                if component_bytes == 1:
+                    r = parameters[cursor]
+                    g = parameters[cursor + 1]
+                    b = parameters[cursor + 2]
+                else:
+                    r16 = int.from_bytes(parameters[cursor : cursor + 2], "big", signed=False)
+                    g16 = int.from_bytes(parameters[cursor + 2 : cursor + 4], "big", signed=False)
+                    b16 = int.from_bytes(parameters[cursor + 4 : cursor + 6], "big", signed=False)
+                    r = _scale_component_to_byte(r16, bits=16)
+                    g = _scale_component_to_byte(g16, bits=16)
+                    b = _scale_component_to_byte(b16, bits=16)
+
+                table[start_index + entry_idx] = (r, g, b)
+                cursor += entry_size
+
+    return table
+
+
+def _scale_component_to_byte(value: int, *, bits: int) -> int:
+    if bits <= 8:
+        return max(0, min(255, value))
+    max_value = (1 << bits) - 1
+    if max_value <= 0:
+        return 0
+    return max(0, min(255, round((value / max_value) * 255.0)))
+
+
+def _extract_color_table(data: bytes) -> dict[int, tuple[int, int, int]]:
+    table: dict[int, tuple[int, int, int]] = {}
+    for element in iter_elements(data):
+        if element.class_id == 5 and element.element_id == 34:
+            table.update(_decode_color_table_parameters(element.parameters))
+    return table
+
+
+def _decode_color_value_extent_parameters(
+    parameters: bytes,
+) -> tuple[int, int, int, int, int, int] | None:
+    """Decode class-1/id-10 Color Value Extent parameters."""
+    if len(parameters) >= 12:
+        values = tuple(
+            int.from_bytes(parameters[idx : idx + 2], "big", signed=False)
+            for idx in (0, 2, 4, 6, 8, 10)
+        )
+        return values  # type: ignore[return-value]
+
+    if len(parameters) >= 6:
+        values = tuple(parameters[idx] for idx in range(6))
+        return values  # type: ignore[return-value]
+
+    return None
+
+
+def _extract_color_value_extent(data: bytes) -> tuple[int, int, int, int, int, int] | None:
+    extent: tuple[int, int, int, int, int, int] | None = None
+    for element in iter_elements(data):
+        if element.class_id == 1 and element.element_id == 10:
+            decoded = _decode_color_value_extent_parameters(element.parameters)
+            if decoded is not None:
+                extent = decoded
+    return extent
+
+
+def _scale_direct16_rgb_payload(
+    payload: bytes,
+    total_pixels: int,
+    *,
+    color_value_extent: tuple[int, int, int, int, int, int] | None,
+) -> bytes | None:
+    required = total_pixels * 6
+    if len(payload) < required:
+        return None
+
+    if color_value_extent is None:
+        mins = (0, 0, 0)
+        maxes = (65535, 65535, 65535)
+    else:
+        mins = color_value_extent[:3]
+        maxes = color_value_extent[3:]
+
+    out = bytearray(required // 2)
+    cursor = 0
+    for px in range(total_pixels):
+        base = px * 6
+        for ch in range(3):
+            value = int.from_bytes(payload[base + (ch * 2) : base + (ch * 2) + 2], "big")
+            low = mins[ch]
+            high = maxes[ch]
+            if high <= low:
+                scaled = 255 if value > high else 0
+            else:
+                bounded = min(max(value, low), high)
+                scaled = round(((bounded - low) / (high - low)) * 255.0)
+            out[cursor] = max(0, min(255, scaled))
+            cursor += 1
+
+    return bytes(out)
+
+
+def _indexed_palette_bytes(color_table: dict[int, tuple[int, int, int]]) -> bytes:
+    channels: list[int] = []
+    for index in range(256):
+        r, g, b = color_table.get(index, _default_palette_entry(index))
+        channels.extend((r, g, b))
+    return bytes(channels)
+
+
+def _format_points(
+    points: list[tuple[float, float]],
+    *,
+    min_y: float,
+    max_y: float,
+) -> str:
+    mapped = (f"{x:.3f},{_map_svg_y(y, min_y=min_y, max_y=max_y):.3f}" for x, y in points)
     return " ".join(mapped)
+
+
+def _map_svg_y(y: float, *, min_y: float, max_y: float) -> float:
+    return max_y - (y - min_y)
+
+
+def _filter_points_for_bounds(
+    points: list[tuple[float, float]],
+    *,
+    vdc_extent: tuple[float, float, float, float] | None,
+) -> list[tuple[float, float]]:
+    """Prefer points near declared VDC extent when computing SVG bounds."""
+    if not points or vdc_extent is None:
+        return points
+
+    min_x, min_y, max_x, max_y = vdc_extent
+    span = max(1.0, max_x - min_x, max_y - min_y)
+    margin = span * 0.25
+    low_x = min_x - margin
+    high_x = max_x + margin
+    low_y = min_y - margin
+    high_y = max_y + margin
+
+    filtered = [(x, y) for x, y in points if (low_x <= x <= high_x) and (low_y <= y <= high_y)]
+    return filtered if filtered else points
+
+
+def _rebase_points_to_vdc_if_better(
+    points: list[tuple[float, float]],
+    *,
+    vdc_extent: tuple[float, float, float, float] | None,
+) -> list[tuple[float, float]]:
+    """Shift local-origin point sets into VDC space when clearly better."""
+    if not points or vdc_extent is None:
+        return points
+
+    min_x, min_y, max_x, max_y = vdc_extent
+    original_penalty = _point_penalty(points, vdc_extent=vdc_extent)
+    if original_penalty <= 0.0:
+        return points
+
+    shifts = [
+        (0.0, 0.0),
+        (min_x, min_y),
+        (min_x, max_y),
+        (max_x, min_y),
+        (max_x, max_y),
+        ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0),
+    ]
+
+    best_points = points
+    best_penalty = original_penalty
+    for dx, dy in shifts:
+        candidate = [(x + dx, y + dy) for x, y in points]
+        penalty = _point_penalty(candidate, vdc_extent=vdc_extent)
+        if penalty < best_penalty:
+            best_penalty = penalty
+            best_points = candidate
+
+    if best_penalty < (original_penalty * 0.7) and (original_penalty - best_penalty) >= 5.0:
+        return best_points
+    return points
+
+
+def _sanitize_points_within_vdc(
+    points: list[tuple[float, float]],
+    *,
+    vdc_extent: tuple[float, float, float, float] | None,
+) -> list[tuple[float, float]]:
+    """Drop implausible outlier vertices when a stable VDC envelope is known."""
+    if len(points) < 2 or vdc_extent is None:
+        return points
+
+    min_x, min_y, max_x, max_y = vdc_extent
+    span = max(1.0, max_x - min_x, max_y - min_y)
+    margin = span * 0.25
+    low_x = min_x - margin
+    high_x = max_x + margin
+    low_y = min_y - margin
+    high_y = max_y + margin
+
+    in_range = [(x, y) for x, y in points if (low_x <= x <= high_x) and (low_y <= y <= high_y)]
+    if len(in_range) < 2 or len(in_range) == len(points):
+        return points
+
+    original_penalty = _point_penalty(points, vdc_extent=vdc_extent)
+    sanitized_penalty = _point_penalty(in_range, vdc_extent=vdc_extent)
+    if sanitized_penalty + 5.0 <= original_penalty:
+        return in_range
+    return points
+
+
+def _extract_vdc_bounded_runs(
+    points: list[tuple[float, float]],
+    *,
+    vdc_extent: tuple[float, float, float, float] | None,
+    min_run_points: int = 3,
+    max_runs: int = 16,
+    max_points_per_run: int = 256,
+) -> list[list[tuple[float, float]]]:
+    """Split noisy point streams into plausible contiguous VDC-bounded runs."""
+    if len(points) < min_run_points:
+        return []
+    if vdc_extent is None:
+        return [points[:max_points_per_run]]
+
+    min_x, min_y, max_x, max_y = vdc_extent
+    span = max(1.0, max_x - min_x, max_y - min_y)
+    margin = span * 0.25
+    low_x = min_x - margin
+    high_x = max_x + margin
+    low_y = min_y - margin
+    high_y = max_y + margin
+
+    runs: list[list[tuple[float, float]]] = []
+    current: list[tuple[float, float]] = []
+
+    for x, y in points:
+        if low_x <= x <= high_x and low_y <= y <= high_y:
+            current.append((x, y))
+            continue
+
+        if len(current) >= min_run_points:
+            runs.append(current[:max_points_per_run])
+            if len(runs) >= max_runs:
+                return runs
+        current = []
+
+    if len(current) >= min_run_points and len(runs) < max_runs:
+        runs.append(current[:max_points_per_run])
+
+    return runs
+
+
+def _decode_i16_be(value: bytes) -> int | None:
+    if len(value) != 2:
+        return None
+    return int.from_bytes(value, "big", signed=True)
+
+
+def _decode_i32_be(value: bytes) -> int | None:
+    if len(value) != 4:
+        return None
+    return int.from_bytes(value, "big", signed=True)
+
+
+def _decode_point_pairs_i16(parameters: bytes) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for offset in range(0, len(parameters) - 3, 4):
+        x = _decode_i16_be(parameters[offset : offset + 2])
+        y = _decode_i16_be(parameters[offset + 2 : offset + 4])
+        if x is None or y is None:
+            continue
+        points.append((float(x), float(y)))
+    return points
+
+
+def _decode_point_pairs_f64(parameters: bytes) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for offset in range(0, len(parameters) - 15, 16):
+        x = _parse_f64_be(parameters[offset : offset + 8])
+        y = _parse_f64_be(parameters[offset + 8 : offset + 16])
+        if x is None or y is None:
+            continue
+        points.append((x, y))
+    return points
+
+
+def _decode_point_pairs_from_profile(
+    parameters: bytes,
+    *,
+    profile: _CgmDescriptorProfile,
+) -> list[tuple[float, float]]:
+    """Decode points using declared CGM descriptor values when available."""
+
+    if profile.vdc_type == 0:
+        precision = profile.vdc_integer_precision
+        if precision is not None and precision <= 16:
+            return _decode_point_pairs_i16(parameters)
+        if precision is not None and precision > 16:
+            return _decode_point_pairs_i32(parameters)
+        # Integer VDC without precision descriptor defaults to a common 16-bit layout.
+        return _decode_point_pairs_i16(parameters)
+
+    if profile.vdc_type == 1:
+        if profile.vdc_real_precision_bits == 64:
+            return _decode_point_pairs_f64(parameters)
+        return _decode_point_pairs_exact(parameters)
+
+    # Unknown VDC descriptor profile: do not guess mixed encodings.
+    return []
+
+
+def _point_penalty(
+    points: list[tuple[float, float]],
+    *,
+    vdc_extent: tuple[float, float, float, float] | None,
+) -> float:
+    if not points:
+        return 1e9
+
+    if vdc_extent is None:
+        penalty = 0.0
+        for x, y in points:
+            if abs(x) > 5_000_000 or abs(y) > 5_000_000:
+                penalty += 25.0
+            if abs(x) > 50_000_000 or abs(y) > 50_000_000:
+                penalty += 250.0
+        return penalty
+
+    min_x, min_y, max_x, max_y = vdc_extent
+    span = max(1.0, max_x - min_x, max_y - min_y)
+    margin = span * 0.25
+    low_x = min_x - margin
+    high_x = max_x + margin
+    low_y = min_y - margin
+    high_y = max_y + margin
+
+    penalty = 0.0
+    for x, y in points:
+        if x < low_x or x > high_x or y < low_y or y > high_y:
+            penalty += 5.0
+        if x < (min_x - span * 10.0) or x > (max_x + span * 10.0):
+            penalty += 50.0
+        if y < (min_y - span * 10.0) or y > (max_y + span * 10.0):
+            penalty += 50.0
+
+    return penalty
+
+
+def _decode_vdc_extent(parameters: bytes) -> tuple[float, float, float, float] | None:
+    if len(parameters) >= 16:
+        real_values: list[float] = []
+        for idx in range(0, 16, 4):
+            value = _parse_f32_be(parameters[idx : idx + 4])
+            if value is None:
+                real_values = []
+                break
+            real_values.append(value)
+        if len(real_values) == 4:
+            x1, y1, x2, y2 = real_values
+            if x1 != x2 and y1 != y2:
+                return min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)
+
+    if len(parameters) >= 8:
+        signed_values = [
+            int.from_bytes(parameters[idx : idx + 2], "big", signed=True) for idx in (0, 2, 4, 6)
+        ]
+        x1, y1, x2, y2 = signed_values
+        if x1 != x2 and y1 != y2:
+            return float(min(x1, x2)), float(min(y1, y2)), float(max(x1, x2)), float(max(y1, y2))
+
+        unsigned_values = [
+            int.from_bytes(parameters[idx : idx + 2], "big", signed=False) for idx in (0, 2, 4, 6)
+        ]
+        x1, y1, x2, y2 = unsigned_values
+        if x1 != x2 and y1 != y2:
+            return float(min(x1, x2)), float(min(y1, y2)), float(max(x1, x2)), float(max(y1, y2))
+
+    return None
+
+
+def _decode_xy(
+    parameters: bytes,
+    *,
+    profile: _CgmDescriptorProfile,
+) -> tuple[float, float] | None:
+    if profile.vdc_type == 0:
+        if profile.vdc_integer_precision is not None and profile.vdc_integer_precision <= 16:
+            if len(parameters) >= 4:
+                x = _decode_i16_be(parameters[:2])
+                y = _decode_i16_be(parameters[2:4])
+                if x is not None and y is not None:
+                    return float(x), float(y)
+            return None
+        if len(parameters) >= 8:
+            x = _decode_i32_be(parameters[:4])
+            y = _decode_i32_be(parameters[4:8])
+            if x is not None and y is not None:
+                return float(x), float(y)
+        return None
+
+    if profile.vdc_type == 1:
+        if profile.vdc_real_precision_bits == 64:
+            if len(parameters) >= 16:
+                x_f64 = _parse_f64_be(parameters[:8])
+                y_f64 = _parse_f64_be(parameters[8:16])
+                if x_f64 is not None and y_f64 is not None:
+                    return x_f64, y_f64
+            return None
+        if len(parameters) >= 8:
+            x_f32 = _parse_f32_be(parameters[:4])
+            y_f32 = _parse_f32_be(parameters[4:8])
+            if x_f32 is not None and y_f32 is not None:
+                return x_f32, y_f32
+        return None
+
+    return None
+
+
+def _decode_pairwise_segments(
+    parameters: bytes,
+    *,
+    profile: _CgmDescriptorProfile,
+) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    points = _decode_point_pairs_from_profile(parameters, profile=profile)
+    segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    for idx in range(0, len(points) - 1, 2):
+        segments.append((points[idx], points[idx + 1]))
+    return segments
+
+
+def _decode_gdp_polyline_points(
+    parameters: bytes,
+    *,
+    profile: _CgmDescriptorProfile,
+) -> list[tuple[float, float]]:
+    """Decode GDP payload coordinates using declared VDC descriptors only."""
+    return _decode_point_pairs_from_profile(parameters, profile=profile)
+
+
+def _decode_rectangle_corners(
+    parameters: bytes,
+    *,
+    profile: _CgmDescriptorProfile,
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    points = _decode_point_pairs_from_profile(parameters, profile=profile)
+    if len(points) >= 2:
+        return points[0], points[1]
+    return None
+
+
+def _decode_circle_data(
+    parameters: bytes,
+    *,
+    profile: _CgmDescriptorProfile,
+) -> tuple[float, float, float] | None:
+    if profile.vdc_type == 0:
+        if profile.vdc_integer_precision is not None and profile.vdc_integer_precision <= 16:
+            if len(parameters) < 6:
+                return None
+            cx_i16 = _decode_i16_be(parameters[0:2])
+            cy_i16 = _decode_i16_be(parameters[2:4])
+            radius_i16 = _decode_i16_be(parameters[4:6])
+            if cx_i16 is None or cy_i16 is None or radius_i16 is None or radius_i16 <= 0:
+                return None
+            return float(cx_i16), float(cy_i16), float(radius_i16)
+
+        if len(parameters) < 12:
+            return None
+        cx_i32 = _decode_i32_be(parameters[0:4])
+        cy_i32 = _decode_i32_be(parameters[4:8])
+        radius_i32 = _decode_i32_be(parameters[8:12])
+        if cx_i32 is None or cy_i32 is None or radius_i32 is None or radius_i32 <= 0:
+            return None
+        return float(cx_i32), float(cy_i32), float(radius_i32)
+
+    if profile.vdc_type == 1:
+        if profile.vdc_real_precision_bits == 64:
+            if len(parameters) < 24:
+                return None
+            cx_f64 = _parse_f64_be(parameters[0:8])
+            cy_f64 = _parse_f64_be(parameters[8:16])
+            radius_f64 = _parse_f64_be(parameters[16:24])
+            if cx_f64 is None or cy_f64 is None or radius_f64 is None or radius_f64 <= 0:
+                return None
+            return cx_f64, cy_f64, abs(radius_f64)
+
+        if len(parameters) < 12:
+            return None
+        cx_f32 = _parse_f32_be(parameters[0:4])
+        cy_f32 = _parse_f32_be(parameters[4:8])
+        radius_f32 = _parse_f32_be(parameters[8:12])
+        if cx_f32 is None or cy_f32 is None or radius_f32 is None or radius_f32 <= 0:
+            return None
+        return cx_f32, cy_f32, abs(radius_f32)
+
+    return None
+
+
+def _decode_ellipse_data(
+    parameters: bytes,
+    *,
+    profile: _CgmDescriptorProfile,
+) -> tuple[float, float, float, float] | None:
+    points = _decode_point_pairs_from_profile(parameters, profile=profile)
+    if len(points) < 3:
+        return None
+
+    center = points[0]
+    major = points[1]
+    minor = points[2]
+    rx = ((major[0] - center[0]) ** 2 + (major[1] - center[1]) ** 2) ** 0.5
+    ry = ((minor[0] - center[0]) ** 2 + (minor[1] - center[1]) ** 2) ** 0.5
+    if rx <= 0 or ry <= 0:
+        return None
+
+    return center[0], center[1], rx, ry
 
 
 def _decode_restricted_text(parameters: bytes) -> tuple[float, float, float, float, str] | None:
@@ -515,9 +1142,6 @@ def _decode_restricted_text(parameters: bytes) -> tuple[float, float, float, flo
         )
 
         if box_w == 0 or box_h == 0:
-            continue
-
-        if abs(box_w) > 1_000_000 or abs(box_h) > 1_000_000:
             continue
 
         return float(anchor_x), float(anchor_y), float(box_w), float(box_h), text
@@ -638,64 +1262,6 @@ def _decode_fax_output_to_bitmap(output: bytes, width: int, height: int) -> list
     return bits
 
 
-def _score_bitmap(bits: list[int], width: int, height: int) -> float:
-    """Return a polarity-agnostic plausibility score for decoded bitmaps."""
-
-    total = len(bits)
-    if total == 0:
-        return 1e9
-
-    black = sum(bits)
-    black_ratio = black / total
-    dominant_ratio = max(black_ratio, 1.0 - black_ratio)
-    # Reject nearly single-color outputs regardless of polarity.
-    if dominant_ratio >= 0.999:
-        return 1e8
-
-    h_steps = max(1, height // 200)
-    v_steps = max(1, width // 200)
-    h_transitions = 0
-    v_transitions = 0
-
-    for y in range(0, height, h_steps):
-        row = y * width
-        prev = bits[row]
-        for x in range(1, width):
-            cur = bits[row + x]
-            if cur != prev:
-                h_transitions += 1
-            prev = cur
-
-    for x in range(0, width, v_steps):
-        prev = bits[x]
-        for y in range(1, height):
-            cur = bits[y * width + x]
-            if cur != prev:
-                v_transitions += 1
-            prev = cur
-
-    h_samples = max(1, ((height + h_steps - 1) // h_steps) * max(1, width - 1))
-    v_samples = max(1, ((width + v_steps - 1) // v_steps) * max(1, height - 1))
-    h_density = h_transitions / h_samples
-    v_density = v_transitions / v_samples
-
-    if max(h_density, v_density) < 0.001:
-        return 1e8
-
-    transition_ratio = min(h_density, v_density) / max(1e-9, h_density, v_density)
-
-    # Prefer bitmaps with meaningful and reasonably balanced structure in both axes.
-    score = 1.0 - transition_ratio
-    if transition_ratio < 0.2:
-        score += 0.8
-    elif transition_ratio < 0.35:
-        score += 0.3
-
-    if max(h_density, v_density) < 0.01:
-        score += 0.3
-    return score
-
-
 def _bitmap_to_png_data_uri(bits: list[int], width: int, height: int) -> str | None:
     """Encode a 0/1 bitmap to a PNG data URI if Pillow is available."""
 
@@ -724,132 +1290,55 @@ def _image_to_png_data_uri(image: Image.Image | None) -> str | None:
     return f"data:image/png;base64,{payload}"
 
 
-def _decode_element29_binary_raster(parameters: bytes) -> tuple[str, int, int] | None:
-    """Best-effort decode for binary class-4/id-29 payloads using CCITT codecs."""
-
-    if imagecodecs is None:
-        return None
-
-    candidate_offsets = [
-        *range(0, 33),
-        157,
-        158,
-        159,
-        160,
-        161,
-        176,
-        184,
-        188,
-        192,
-        196,
-        200,
-        208,
-        224,
-        240,
-        256,
-    ]
-    candidate_sizes = [
-        (768, 1099),
-        (767, 1099),
-        (768, 1100),
-        (576, 768),
-        (575, 767),
-    ]
-
-    best_score = 1e9
-    best_bits: list[int] | None = None
-    best_size: tuple[int, int] | None = None
-    best_black_ratio = -1.0
-
-    for offset in candidate_offsets:
-        payload = parameters[offset:]
-        if not payload:
-            continue
-
-        for width, height in candidate_sizes:
-            # Try Group 4 first, then Group 3 options.
-            decode_attempts: list[tuple[bytes, str]] = []
-            try:
-                decode_attempts.append(
-                    (
-                        bytes(imagecodecs.ccittfax4_decode(payload, height=height, width=width)),
-                        "fax4",
-                    )
-                )
-            except (RuntimeError, ValueError):
-                pass
-
-            for t4options in (0, 2, 4, 6, 1, 3, 5, 7):
-                try:
-                    decoded = imagecodecs.ccittfax3_decode(
-                        payload,
-                        height=height,
-                        width=width,
-                        t4options=t4options,
-                    )
-                    decode_attempts.append((bytes(decoded), f"fax3:{t4options}"))
-                except (RuntimeError, ValueError):
-                    continue
-
-            for decoded, _decoder_name in decode_attempts:
-                bits = _decode_fax_output_to_bitmap(decoded, width, height)
-                if bits is None:
-                    continue
-
-                for invert in (False, True):
-                    candidate = [1 - bit for bit in bits] if invert else bits
-                    score = _score_bitmap(candidate, width, height)
-                    black_ratio = sum(candidate) / len(candidate)
-                    if score < best_score:
-                        best_score = score
-                        best_bits = candidate
-                        best_size = (width, height)
-                        best_black_ratio = black_ratio
-                    elif abs(score - best_score) <= 1e-9 and black_ratio > best_black_ratio:
-                        # Polarity-agnostic scoring can tie exact inversions; prefer dark canvas
-                        # fallback for these binary element-29 payloads so white detail remains
-                        # visible.
-                        best_bits = candidate
-                        best_size = (width, height)
-                        best_black_ratio = black_ratio
-
-    if best_bits is None or best_size is None:
-        return None
-
-    width, height = best_size
-    data_uri = _bitmap_to_png_data_uri(best_bits, width, height)
-    if data_uri is None:
-        return None
-    return data_uri, width, height
-
-
-def extract_vector_svg_from_bytes(data: bytes) -> str:
-    """Convert vector-like CGM primitives from bytes into a best-effort SVG string."""
+def extract_vector_svg_from_bytes(
+    data: bytes,
+) -> str:
+    """Convert supported CGM vector primitives and raster tile backgrounds into SVG."""
     style = _SvgStyle()
+    color_table = _extract_color_table(data)
     text_items: list[tuple[float, float, str, str, float]] = []
     restricted_text_items: list[tuple[float, float, float, float, str, str, float]] = []
     polyline_items: list[tuple[list[tuple[float, float]], str, float]] = []
     polygon_items: list[tuple[list[tuple[float, float]], str, float]] = []
+    marker_items: list[tuple[float, float, str, float]] = []
+    rectangle_items: list[tuple[float, float, float, float, str, float]] = []
+    circle_items: list[tuple[float, float, float, str, float]] = []
+    ellipse_items: list[tuple[float, float, float, float, str, float]] = []
     gdp_parameters: list[bytes] = []
-    unsupported_class4: Counter[int] = Counter()
     element29_payloads: list[bytes] = []
-    element29_raster_rendered = False
     vdc_extent: tuple[float, float, float, float] | None = None
-    raster_background = _render_raster_background_data_uri(data)
+    descriptor_profile = _extract_descriptor_profile(data)
+    raster_tile_overlays = _render_first_tile_array_overlays(data)
+    raster_background = (
+        None if raster_tile_overlays is not None else _render_raster_background_data_uri(data)
+    )
+    transparency_enabled = True
+    clip_enabled = False
+    clip_rectangle: tuple[float, float, float, float] | None = None
 
     for element in iter_elements(data):
-        if element.class_id == 2 and element.element_id == 6 and len(element.parameters) >= 8:
-            x1 = int.from_bytes(element.parameters[0:2], "big", signed=False)
-            y1 = int.from_bytes(element.parameters[2:4], "big", signed=False)
-            x2 = int.from_bytes(element.parameters[4:6], "big", signed=False)
-            y2 = int.from_bytes(element.parameters[6:8], "big", signed=False)
-            if x1 != x2 and y1 != y2:
-                vdc_extent = (
-                    float(min(x1, x2)),
-                    float(min(y1, y2)),
-                    float(max(x1, x2)),
-                    float(max(y1, y2)),
-                )
+        if element.class_id == 2 and element.element_id == 6:
+            decoded_vdc = _decode_vdc_extent(element.parameters)
+            if decoded_vdc is not None:
+                vdc_extent = decoded_vdc
+            continue
+
+        if element.class_id == 3 and element.element_id == 4:
+            mode = _decode_transparency_mode(element.parameters)
+            if isinstance(mode, bool):
+                transparency_enabled = mode
+            continue
+
+        if element.class_id == 3 and element.element_id == 5:
+            decoded_clip = _decode_vdc_extent(element.parameters)
+            if decoded_clip is not None:
+                clip_rectangle = decoded_clip
+            continue
+
+        if element.class_id == 3 and element.element_id == 6:
+            indicator = _decode_clip_indicator(element.parameters)
+            if isinstance(indicator, bool):
+                clip_enabled = indicator
             continue
 
         if element.class_id == 5:
@@ -858,7 +1347,10 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
                 if width is not None and width > 0:
                     style.stroke_width = max(0.25, width)
             elif element.element_id == 4 and element.parameters:
-                style.stroke_color = _palette_index_to_hex(element.parameters[0])
+                style.stroke_color = _palette_index_to_hex(
+                    element.parameters[0],
+                    color_table=color_table,
+                )
             elif element.element_id == 15 and len(element.parameters) >= 4:
                 char_height = _parse_f32_be(element.parameters[:4])
                 if char_height is not None and char_height > 0:
@@ -869,21 +1361,110 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
             continue
 
         if element.element_id == 1:
-            points = _decode_point_pairs_exact(element.parameters)
+            points = _decode_point_pairs_from_profile(
+                element.parameters,
+                profile=descriptor_profile,
+            )
             if len(points) >= 2:
                 polyline_items.append((points, style.stroke_color, style.stroke_width))
+        elif element.element_id == 2:
+            for start, end in _decode_pairwise_segments(
+                element.parameters,
+                profile=descriptor_profile,
+            ):
+                polyline_items.append(([start, end], style.stroke_color, style.stroke_width))
+        elif element.element_id == 3:
+            points = _decode_point_pairs_from_profile(
+                element.parameters,
+                profile=descriptor_profile,
+            )
+            for marker_x, marker_y in points:
+                marker_items.append((marker_x, marker_y, style.stroke_color, style.marker_size))
+        elif element.element_id == 4:
+            appended = _decode_cgm_text(element.parameters)
+            if appended and text_items:
+                last_x, last_y, last_text, last_color, last_font = text_items[-1]
+                text_items[-1] = (last_x, last_y, f"{last_text}{appended}", last_color, last_font)
         elif element.element_id == 7:
-            points = _decode_point_pairs_exact(element.parameters)
+            points = _decode_point_pairs_from_profile(
+                element.parameters,
+                profile=descriptor_profile,
+            )
             if len(points) >= 3:
                 polygon_items.append((points, style.stroke_color, style.stroke_width))
-        elif element.element_id == 5 and len(element.parameters) >= 8:
-            x = _parse_f32_be(element.parameters[0:4])
-            y = _parse_f32_be(element.parameters[4:8])
+        elif element.element_id == 8:
+            points = _decode_point_pairs_from_profile(
+                element.parameters,
+                profile=descriptor_profile,
+            )
+            if len(points) >= 3:
+                polygon_items.append((points, style.stroke_color, style.stroke_width))
+        elif element.element_id == 5:
+            xy = _decode_xy(
+                element.parameters,
+                profile=descriptor_profile,
+            )
+            if xy is None:
+                continue
+            x, y = xy
             text = _decode_cgm_text(element.parameters[8:])
-            if x is not None and y is not None and text:
+            if text is None:
+                text = _decode_cgm_text(element.parameters[4:])
+            if text:
                 text_items.append((x, y, text, style.stroke_color, style.font_size))
-        elif element.element_id == 26:
+        elif element.element_id == 6:
+            appended = _decode_cgm_text(element.parameters)
+            if appended and text_items:
+                last_x, last_y, last_text, last_color, last_font = text_items[-1]
+                text_items[-1] = (last_x, last_y, f"{last_text}{appended}", last_color, last_font)
+        elif element.element_id in (10, 26):
             gdp_parameters.append(element.parameters)
+        elif element.element_id == 11:
+            corners = _decode_rectangle_corners(
+                element.parameters,
+                profile=descriptor_profile,
+            )
+            if corners is None:
+                continue
+            (x1, y1), (x2, y2) = corners
+            rectangle_items.append(
+                (
+                    min(x1, x2),
+                    min(y1, y2),
+                    abs(x2 - x1),
+                    abs(y2 - y1),
+                    style.stroke_color,
+                    style.stroke_width,
+                )
+            )
+        elif element.element_id == 12:
+            circle = _decode_circle_data(element.parameters, profile=descriptor_profile)
+            if circle is None:
+                continue
+            cx, cy, radius = circle
+            circle_items.append((cx, cy, radius, style.stroke_color, style.stroke_width))
+        elif element.element_id in (13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 27):
+            arc_points = _decode_point_pairs_from_profile(
+                element.parameters,
+                profile=descriptor_profile,
+            )
+            if len(arc_points) >= 2:
+                polyline_items.append((arc_points, style.stroke_color, style.stroke_width))
+        elif element.element_id == 28:
+            # Profile-specific mixed payload; strict mode does not infer a vector fallback.
+            continue
+        elif element.element_id == 9:
+            # Cell Array payloads are handled through raster background extraction.
+            continue
+        elif element.element_id == 17:
+            ellipse = _decode_ellipse_data(
+                element.parameters,
+                profile=descriptor_profile,
+            )
+            if ellipse is None:
+                continue
+            cx, cy, rx, ry = ellipse
+            ellipse_items.append((cx, cy, rx, ry, style.stroke_color, style.stroke_width))
         elif element.element_id == 29:
             restricted = _decode_restricted_text(element.parameters)
             if restricted is not None:
@@ -893,21 +1474,31 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
                 )
             else:
                 element29_payloads.append(element.parameters)
-                unsupported_class4[element.element_id] += 1
-        else:
-            unsupported_class4[element.element_id] += 1
 
-    if not polyline_items and not polygon_items:
-        for parameters in gdp_parameters:
-            points = _decode_point_pairs_heuristic(parameters)
-            if len(points) >= 2:
-                polyline_items.append((points, style.stroke_color, style.stroke_width))
+    for parameters in gdp_parameters:
+        points = _decode_gdp_polyline_points(
+            parameters,
+            profile=descriptor_profile,
+        )
+        if len(points) >= 2:
+            polyline_items.append((points, style.stroke_color, style.stroke_width))
 
     all_points: list[tuple[float, float]] = []
     for points, _, _ in polyline_items:
         all_points.extend(points)
     for points, _, _ in polygon_items:
         all_points.extend(points)
+    for x, y, _, _ in marker_items:
+        all_points.append((x, y))
+    for x, y, rect_w, rect_h, _, _ in rectangle_items:
+        all_points.append((x, y))
+        all_points.append((x + rect_w, y + rect_h))
+    for cx, cy, radius, _, _ in circle_items:
+        all_points.append((cx - radius, cy - radius))
+        all_points.append((cx + radius, cy + radius))
+    for cx, cy, rx, ry, _, _ in ellipse_items:
+        all_points.append((cx - rx, cy - ry))
+        all_points.append((cx + rx, cy + ry))
     for x, y, _, _, _ in text_items:
         all_points.append((x, y))
     for x, y, box_w, box_h, _, _, _ in restricted_text_items:
@@ -915,20 +1506,29 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
         all_points.append((x + box_w, y + box_h))
 
     if all_points:
-        min_x = min(point[0] for point in all_points)
-        max_x = max(point[0] for point in all_points)
-        min_y = min(point[1] for point in all_points)
-        max_y = max(point[1] for point in all_points)
+        bounds_points = _filter_points_for_bounds(all_points, vdc_extent=vdc_extent)
+        min_x = min(point[0] for point in bounds_points)
+        max_x = max(point[0] for point in bounds_points)
+        min_y = min(point[1] for point in bounds_points)
+        max_y = max(point[1] for point in bounds_points)
     elif vdc_extent is not None:
         min_x, min_y, max_x, max_y = vdc_extent
+    elif raster_tile_overlays is not None:
+        _tile_entries, raster_w, raster_h = raster_tile_overlays
+        min_x, min_y, max_x, max_y = 0.0, 0.0, float(raster_w), float(raster_h)
     elif raster_background is not None:
         _href, raster_w, raster_h = raster_background
         min_x, min_y, max_x, max_y = 0.0, 0.0, float(raster_w), float(raster_h)
     else:
         min_x, min_y, max_x, max_y = 0.0, 0.0, 100.0, 100.0
 
-    width = max(1.0, max_x - min_x)
-    height = max(1.0, max_y - min_y)
+    min_x = round(min_x, 3)
+    min_y = round(min_y, 3)
+    max_x = round(max_x, 3)
+    max_y = round(max_y, 3)
+
+    width = max(1.0, round(max_x - min_x, 3))
+    height = max(1.0, round(max_y - min_y, 3))
 
     svg_lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -938,43 +1538,122 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
         ),
     ]
 
-    if raster_background is not None:
+    if not transparency_enabled:
+        svg_lines.append(
+            f'  <rect x="{min_x:.3f}" y="{min_y:.3f}" width="{width:.3f}" '
+            f'height="{height:.3f}" fill="#ffffff" stroke="none" />'
+        )
+
+    clip_id = "cgmClip0"
+    clip_attr = ""
+    if clip_enabled and clip_rectangle is not None:
+        clip_x1, clip_y1, clip_x2, clip_y2 = clip_rectangle
+        clip_min_x = min(clip_x1, clip_x2)
+        clip_max_x = max(clip_x1, clip_x2)
+        clip_min_y = min(clip_y1, clip_y2)
+        clip_max_y = max(clip_y1, clip_y2)
+        clip_w = max(0.0, clip_max_x - clip_min_x)
+        clip_h = max(0.0, clip_max_y - clip_min_y)
+        if clip_w > 0.0 and clip_h > 0.0:
+            clip_svg_y = _map_svg_y(clip_max_y, min_y=min_y, max_y=max_y)
+            svg_lines.append("  <defs>")
+            svg_lines.append(f'    <clipPath id="{clip_id}">')
+            svg_lines.append(
+                f'      <rect x="{clip_min_x:.3f}" y="{clip_svg_y:.3f}" '
+                f'width="{clip_w:.3f}" height="{clip_h:.3f}" />'
+            )
+            svg_lines.append("    </clipPath>")
+            svg_lines.append("  </defs>")
+            clip_attr = f' clip-path="url(#{clip_id})"'
+
+    if raster_tile_overlays is not None:
+        tile_entries, tile_total_w, tile_total_h = raster_tile_overlays
+        scale_x = width / max(1.0, float(tile_total_w))
+        scale_y = height / max(1.0, float(tile_total_h))
+        for href, tile_x, tile_y, tile_w, tile_h in tile_entries:
+            mapped_x = min_x + (tile_x * scale_x)
+            mapped_y = min_y + (tile_y * scale_y)
+            mapped_w = max(0.0, tile_w * scale_x)
+            mapped_h = max(0.0, tile_h * scale_y)
+            if mapped_w <= 0.0 or mapped_h <= 0.0:
+                continue
+            svg_lines.append(
+                f'  <image x="{mapped_x:.3f}" y="{mapped_y:.3f}" '
+                f'width="{mapped_w:.3f}" height="{mapped_h:.3f}" preserveAspectRatio="none" '
+                f'image-rendering="pixelated" href="{href}"{clip_attr} />'
+            )
+    elif raster_background is not None:
         href, _raster_w, _raster_h = raster_background
         svg_lines.append(
             f'  <image x="{min_x:.3f}" y="{min_y:.3f}" width="{width:.3f}" '
             f'height="{height:.3f}" preserveAspectRatio="xMidYMid meet" '
-            f'image-rendering="pixelated" href="{href}" />'
+            f'image-rendering="pixelated" href="{href}"{clip_attr} />'
         )
 
-    svg_lines.append('  <g fill="none" stroke-linecap="round" stroke-linejoin="round">')
+    svg_lines.append(f'  <g fill="none" stroke-linecap="round" stroke-linejoin="round"{clip_attr}>')
 
     for points, stroke_color, stroke_width in polyline_items:
-        point_str = _format_points(points, min_y=min_y, max_y=max_y)
+        point_str = _format_points(
+            points,
+            min_y=min_y,
+            max_y=max_y,
+        )
         svg_lines.append(
             f'    <polyline points="{point_str}" stroke="{stroke_color}" '
             f'stroke-width="{stroke_width:.3f}" />'
         )
 
     for points, stroke_color, stroke_width in polygon_items:
-        point_str = _format_points(points, min_y=min_y, max_y=max_y)
+        point_str = _format_points(
+            points,
+            min_y=min_y,
+            max_y=max_y,
+        )
         svg_lines.append(
             f'    <polygon points="{point_str}" stroke="{stroke_color}" '
+            f'stroke-width="{stroke_width:.3f}" fill="none" />'
+        )
+
+    for x, y, marker_color, marker_size in marker_items:
+        svg_lines.append(
+            f'    <circle cx="{x:.3f}" cy="{_map_svg_y(y, min_y=min_y, max_y=max_y):.3f}" '
+            f'r="{marker_size:.3f}" fill="{marker_color}" stroke="none" />'
+        )
+
+    for x, y, rect_w, rect_h, stroke_color, stroke_width in rectangle_items:
+        svg_lines.append(
+            f'    <rect x="{x:.3f}" y="{_map_svg_y(y + rect_h, min_y=min_y, max_y=max_y):.3f}" '
+            f'width="{rect_w:.3f}" height="{rect_h:.3f}" stroke="{stroke_color}" '
+            f'stroke-width="{stroke_width:.3f}" fill="none" />'
+        )
+
+    for cx, cy, radius, stroke_color, stroke_width in circle_items:
+        svg_lines.append(
+            f'    <circle cx="{cx:.3f}" cy="{_map_svg_y(cy, min_y=min_y, max_y=max_y):.3f}" '
+            f'r="{radius:.3f}" stroke="{stroke_color}" stroke-width="{stroke_width:.3f}" '
+            'fill="none" />'
+        )
+
+    for cx, cy, rx, ry, stroke_color, stroke_width in ellipse_items:
+        svg_lines.append(
+            f'    <ellipse cx="{cx:.3f}" cy="{_map_svg_y(cy, min_y=min_y, max_y=max_y):.3f}" '
+            f'rx="{rx:.3f}" ry="{ry:.3f}" stroke="{stroke_color}" '
             f'stroke-width="{stroke_width:.3f}" fill="none" />'
         )
 
     svg_lines.append("  </g>")
 
     for x, y, text, stroke_color, font_size in text_items:
-        mapped_y = max_y - (y - min_y)
+        mapped_y = _map_svg_y(y, min_y=min_y, max_y=max_y)
         escaped = html.escape(text)
         svg_lines.append(
             f'  <text x="{x:.3f}" y="{mapped_y:.3f}" '
             f'fill="{stroke_color}" font-size="{font_size:.3f}" '
-            f'font-family="sans-serif">{escaped}</text>'
+            f'font-family="sans-serif"{clip_attr}>{escaped}</text>'
         )
 
     for x, y, box_w, box_h, text, stroke_color, font_size in restricted_text_items:
-        mapped_y = max_y - (y - min_y)
+        mapped_y = _map_svg_y(y, min_y=min_y, max_y=max_y)
         box_width = max(1.0, abs(box_w))
         capped_font = max(4.0, min(font_size, abs(box_h)))
         escaped = html.escape(text)
@@ -982,101 +1661,39 @@ def extract_vector_svg_from_bytes(data: bytes) -> str:
             f'  <text x="{x:.3f}" y="{mapped_y:.3f}" '
             f'fill="{stroke_color}" font-size="{capped_font:.3f}" '
             f'font-family="sans-serif" textLength="{box_width:.3f}" '
-            f'lengthAdjust="spacingAndGlyphs">{escaped}</text>'
+            f'lengthAdjust="spacingAndGlyphs"{clip_attr}>{escaped}</text>'
         )
 
     if (
         not polyline_items
         and not polygon_items
+        and not marker_items
+        and not rectangle_items
+        and not circle_items
+        and not ellipse_items
         and not text_items
         and not restricted_text_items
         and raster_background is None
         and element29_payloads
     ):
-        decoded = _decode_element29_binary_raster(element29_payloads[0])
-        if decoded is not None:
-            href, raster_width, raster_height = decoded
-            element29_raster_rendered = True
-            svg_lines.append(
-                f'  <image x="{min_x:.3f}" y="{min_y:.3f}" width="{width:.3f}" '
-                f'height="{height:.3f}" preserveAspectRatio="xMidYMid meet" '
-                f'image-rendering="pixelated" href="{href}" />'
-            )
-            if log.isEnabledFor(logging.DEBUG):
-                log.debug(
-                    "Rendered class-4/id-29 payload as raster image (%dx%d)",
-                    raster_width,
-                    raster_height,
-                )
-
-    if (
-        not polyline_items
-        and not polygon_items
-        and not text_items
-        and not restricted_text_items
-        and raster_background is None
-        and not element29_raster_rendered
-        and unsupported_class4
-    ):
-        unsupported_summary = ", ".join(
-            f"id {element_id} x{count}" for element_id, count in unsupported_class4.most_common(4)
-        )
-        diagnostics = ""
-        if element29_payloads:
-            analysis = _analyze_element29_payload(element29_payloads[0])
-            ascii_ratio = analysis.get("ascii_ratio", 0.0)
-            entropy_value = analysis.get("entropy_bits_per_byte", 0.0)
-            leading_ff_value = analysis.get("leading_ff_run", 0)
-            ratio = float(ascii_ratio) * 100 if isinstance(ascii_ratio, (int, float)) else 0.0
-            entropy = float(entropy_value) if isinstance(entropy_value, (int, float)) else 0.0
-            leading_ff = int(leading_ff_value) if isinstance(leading_ff_value, int) else 0
-            diagnostics = (
-                f"Element 29 payload looks binary (printable ASCII: {ratio:.1f}%, "
-                f"entropy: {entropy:.2f}, leading 0xFF run: {leading_ff}). "
-                "Expected Restricted Text fields were not detected."
-            )
-        fallback_font = max(10.0, min(24.0, height * 0.04))
-        line_gap = fallback_font * 1.3
-        left = min_x + width * 0.04
-        top = min_y + height * 0.15
-
-        svg_lines.append(
-            f'  <rect x="{min_x:.3f}" y="{min_y:.3f}" width="{width:.3f}" '
-            f'height="{height:.3f}" fill="#f7f7f7" stroke="#666" stroke-width="1" />'
-        )
-        svg_lines.append(
-            f'  <text x="{left:.3f}" y="{top:.3f}" fill="#111" font-size="{fallback_font:.3f}" '
-            'font-family="sans-serif">CGM contains unsupported drawing primitives.</text>'
-        )
-        svg_lines.append(
-            f'  <text x="{left:.3f}" y="{(top + line_gap):.3f}" fill="#333" '
-            f'font-size="{(fallback_font * 0.9):.3f}" font-family="sans-serif">'
-            f"Detected: {html.escape(unsupported_summary)}</text>"
-        )
-
-        if diagnostics:
-            svg_lines.append(
-                f'  <text x="{left:.3f}" y="{(top + line_gap * 2):.3f}" fill="#333" '
-                f'font-size="{(fallback_font * 0.75):.3f}" font-family="sans-serif">'
-                f"{html.escape(diagnostics)}</text>"
-            )
-
-        if log.isEnabledFor(logging.DEBUG):
-            log.debug("SVG fallback used; unsupported class-4 elements: %s", unsupported_summary)
-            if diagnostics:
-                log.debug("Element 29 diagnostics: %s", diagnostics)
+        # Class-4/id-29 raster fallback is not implemented without explicit standard metadata.
+        pass
 
     svg_lines.append("</svg>")
     return "\n".join(svg_lines) + "\n"
 
 
-def extract_vector_svg(file_path: str | Path) -> str:
-    """Convert a CGM file to a best-effort SVG document string."""
+def extract_vector_svg(
+    file_path: str | Path,
+) -> str:
+    """Convert a CGM file to SVG using the supported vector and raster paths."""
     path = Path(file_path)
     raw = path.read_bytes()
     if log.isEnabledFor(logging.DEBUG):
         log.debug("Loaded CGM file %s (%d bytes) for vector SVG conversion", path, len(raw))
-    return extract_vector_svg_from_bytes(raw)
+    return extract_vector_svg_from_bytes(
+        raw,
+    )
 
 
 def extract_vector_svg_to_directory(
@@ -1089,14 +1706,18 @@ def extract_vector_svg_to_directory(
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     target = out_dir / f"{stem}_0000.svg"
-    svg = extract_vector_svg(file_path)
+    svg = extract_vector_svg(
+        file_path,
+    )
     target.write_text(svg, encoding="utf-8")
     if log.isEnabledFor(logging.DEBUG):
         log.debug("Wrote vector SVG: %s", target)
     return target
 
 
-def _build_data_snapshot(data: bytes) -> dict[str, object]:
+def _build_data_snapshot(
+    data: bytes,
+) -> dict[str, object]:
     element_histogram: Counter[tuple[int, int]] = Counter()
     elements: list[dict[str, object]] = []
     element29_analysis: list[dict[str, object]] = []
@@ -1118,6 +1739,8 @@ def _build_data_snapshot(data: bytes) -> dict[str, object]:
                 {
                     "offset": element.offset,
                     **_analyze_element29_payload(element.parameters),
+                    "decode_candidates": [],
+                    "has_plausible_decode": False,
                 }
             )
 
@@ -1129,6 +1752,8 @@ def _build_data_snapshot(data: bytes) -> dict[str, object]:
             "element_offset": image.element_offset,
             "width": image.width,
             "height": image.height,
+            "local_color_precision": image.local_color_precision,
+            "cell_representation_mode": image.cell_representation_mode,
             "payload_size": len(image.payload),
             "payload_hex": image.payload.hex(),
         }
@@ -1166,23 +1791,33 @@ def _build_data_snapshot(data: bytes) -> dict[str, object]:
         "element29_analysis": element29_analysis,
         "raw_images": raw_image_items,
         "hotspots": hotspot_items,
-        "vector_svg": extract_vector_svg_from_bytes(data),
+        "vector_svg": extract_vector_svg_from_bytes(
+            data,
+        ),
     }
 
 
-def extract_data_json_from_bytes(data: bytes) -> str:
+def extract_data_json_from_bytes(
+    data: bytes,
+) -> str:
     """Serialize parsed CGM content, extracted payloads, and SVG into JSON."""
-    snapshot = _build_data_snapshot(data)
+    snapshot = _build_data_snapshot(
+        data,
+    )
     return json.dumps(snapshot, indent=2)
 
 
-def extract_data_json(file_path: str | Path) -> str:
+def extract_data_json(
+    file_path: str | Path,
+) -> str:
     """Load a CGM file and serialize parsed data to JSON."""
     path = Path(file_path)
     raw = path.read_bytes()
     if log.isEnabledFor(logging.DEBUG):
         log.debug("Loaded CGM file %s (%d bytes) for JSON export", path, len(raw))
-    return extract_data_json_from_bytes(raw)
+    return extract_data_json_from_bytes(
+        raw,
+    )
 
 
 def extract_data_json_to_directory(
@@ -1195,7 +1830,9 @@ def extract_data_json_to_directory(
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     target = out_dir / f"{stem}_0000.json"
-    json_text = extract_data_json(file_path)
+    json_text = extract_data_json(
+        file_path,
+    )
     target.write_text(json_text + "\n", encoding="utf-8")
     if log.isEnabledFor(logging.DEBUG):
         log.debug("Wrote data JSON: %s", target)
@@ -1225,7 +1862,12 @@ def extract_raw_images_from_bytes(data: bytes) -> list[RawImage]:
                 len(element.parameters),
             )
 
-        width, height, payload_offset = _parse_cell_array_hints(element.parameters)
+        metadata = _parse_cell_array_metadata(element.parameters)
+        width = metadata["width"] if isinstance(metadata["width"], int) else None
+        height = metadata["height"] if isinstance(metadata["height"], int) else None
+        payload_offset = (
+            metadata["payload_offset"] if isinstance(metadata["payload_offset"], int) else 0
+        )
         payload = (
             element.parameters[payload_offset:] if payload_offset < len(element.parameters) else b""
         )
@@ -1251,6 +1893,12 @@ def extract_raw_images_from_bytes(data: bytes) -> list[RawImage]:
                 payload=payload,
                 width=width,
                 height=height,
+                local_color_precision=metadata["local_color_precision"]
+                if isinstance(metadata["local_color_precision"], int)
+                else None,
+                cell_representation_mode=metadata["cell_representation_mode"]
+                if isinstance(metadata["cell_representation_mode"], int)
+                else None,
             )
         )
         image_index += 1
@@ -1340,6 +1988,45 @@ def _extract_text_numbers(statement: str) -> list[float]:
 
 
 def _extract_hex_payload(statement: str) -> bytes:
+    tail = statement
+    for marker in ("''", '""'):
+        idx = tail.find(marker)
+        if idx >= 0:
+            tail = tail[idx + len(marker) :]
+            break
+
+    tail_chunks = re.findall(r"[0-9A-Fa-f]+", tail)
+    if tail_chunks:
+        combined = "".join(tail_chunks)
+        if len(combined) & 1:
+            combined = combined[:-1]
+        if combined:
+            try:
+                return bytes.fromhex(combined)
+            except ValueError:
+                pass
+
+    words = statement.split()
+    # Tile payloads are typically at the end of the statement and may be short.
+    tokens: list[str] = []
+    for token in words:
+        candidate = token.strip().strip("'\",()")
+        if len(candidate) < 4 or (len(candidate) & 1):
+            continue
+        if re.fullmatch(r"[0-9A-Fa-f]+", candidate) is None:
+            continue
+        tokens.append(candidate)
+
+    if tokens:
+        combined = "".join(tokens)
+        if len(combined) & 1:
+            combined = combined[:-1]
+        if combined:
+            try:
+                return bytes.fromhex(combined)
+            except ValueError:
+                pass
+
     runs = _TEXT_HEX_RUN_RE.findall(statement)
     if not runs:
         return b""
@@ -1365,7 +2052,200 @@ def _tile_axis_sizes(total: int, count: int) -> list[int]:
     return [base + (1 if idx < remainder else 0) for idx in range(count)]
 
 
-def _parse_text_tile_arrays(data: bytes) -> list[dict[str, object]]:
+def _infer_tile_grid(tile_count: int, total_w: int, total_h: int) -> tuple[int, int]:
+    if tile_count <= 1:
+        return 1, 1
+
+    target_aspect = (total_w / total_h) if total_h > 0 else float(total_w)
+    best_cols = 1
+    best_rows = tile_count
+    best_error = float("inf")
+
+    for rows in range(1, tile_count + 1):
+        if tile_count % rows != 0:
+            continue
+        cols = tile_count // rows
+        aspect = cols / rows
+        error = abs(aspect - target_aspect)
+        if error < best_error:
+            best_error = error
+            best_cols = cols
+            best_rows = rows
+
+    return best_cols, best_rows
+
+
+_TEXT_TILE_COMMAND_FAMILY: dict[str, str | None] = {
+    "BITONALTILE": None,
+    "COLORTILE": None,
+    "COLOURTILE": None,
+    "DIRECTCOLORTILE": None,
+    "DIRECTCOLOURTILE": None,
+    "INDEXCOLORTILE": "indexed",
+    "INDEXCOLOURTILE": "indexed",
+    "MONOCHROMETILE": None,
+}
+
+
+def _make_tile_array_record(
+    *,
+    cols: int,
+    rows: int,
+    tile_width: int,
+    tile_height: int,
+    total_width: int,
+    total_height: int,
+    cell_path: int = 0,
+) -> dict[str, object]:
+    return {
+        "cols": max(1, cols),
+        "rows": max(1, rows),
+        "tile_width": max(1, tile_width),
+        "tile_height": max(1, tile_height),
+        "total_width": max(1, total_width),
+        "total_height": max(1, total_height),
+        "cell_path": cell_path,
+        "tiles": [],
+    }
+
+
+def _append_tile_record(
+    array: dict[str, object],
+    *,
+    payload: bytes,
+    compression: int | None,
+    bit_order: int | None,
+    orientation: int | None,
+    family: str | None,
+    local_color_precision: int | None = None,
+    cell_representation_mode: int | None = None,
+    row_padding: int | None = None,
+) -> None:
+    tiles = array.get("tiles")
+    if not isinstance(tiles, list):
+        return
+    tiles.append(
+        {
+            "payload": payload,
+            "compression": compression,
+            "bit_order": bit_order,
+            "orientation": orientation,
+            "family": family,
+            "local_color_precision": local_color_precision,
+            "cell_representation_mode": cell_representation_mode,
+            "row_padding": row_padding,
+        }
+    )
+
+
+def _finalize_tile_array_record(
+    array: dict[str, object],
+) -> dict[str, object] | None:
+    tiles = array.get("tiles")
+    if not isinstance(tiles, list) or not tiles:
+        return None
+
+    cols = _coerce_int(array.get("cols", 1))
+    rows = _coerce_int(array.get("rows", 1))
+    tile_w = _coerce_int(array.get("tile_width", 1))
+    tile_h = _coerce_int(array.get("tile_height", 1))
+    total_w = _coerce_int(array.get("total_width", 1))
+    total_h = _coerce_int(array.get("total_height", 1))
+
+    cell_path = _coerce_int(array.get("cell_path", 0))
+    return _make_tile_array_record(
+        cols=cols,
+        rows=rows,
+        tile_width=tile_w,
+        tile_height=tile_h,
+        total_width=total_w,
+        total_height=total_h,
+        cell_path=cell_path,
+    ) | {"tiles": tiles}
+
+
+def _parse_binary_tile_arrays(
+    data: bytes,
+) -> list[dict[str, object]]:
+    """Synthesize tile-array metadata from binary Cell Array sequences."""
+    array = _make_tile_array_record(
+        cols=1,
+        rows=1,
+        tile_width=1,
+        tile_height=1,
+        total_width=1,
+        total_height=1,
+    )
+    common_total_w: int | None = None
+    common_total_h: int | None = None
+    tile_count = 0
+
+    for element in iter_elements(data):
+        if element.class_id != CELL_ARRAY_CLASS_ID or element.element_id != CELL_ARRAY_ELEMENT_ID:
+            continue
+
+        metadata = _parse_cell_array_metadata(element.parameters)
+        width = metadata["width"] if isinstance(metadata["width"], int) else None
+        height = metadata["height"] if isinstance(metadata["height"], int) else None
+        payload_offset = (
+            metadata["payload_offset"] if isinstance(metadata["payload_offset"], int) else 0
+        )
+        payload = (
+            element.parameters[payload_offset:] if payload_offset < len(element.parameters) else b""
+        )
+        if not payload:
+            continue
+
+        if width is not None and width > 0:
+            common_total_w = width if common_total_w is None else common_total_w
+        if height is not None and height > 0:
+            common_total_h = height if common_total_h is None else common_total_h
+
+        _append_tile_record(
+            array,
+            payload=bytes(payload),
+            compression=None,
+            bit_order=None,
+            orientation=None,
+            family=None,
+            local_color_precision=metadata["local_color_precision"]
+            if isinstance(metadata["local_color_precision"], int)
+            else None,
+            cell_representation_mode=metadata["cell_representation_mode"]
+            if isinstance(metadata["cell_representation_mode"], int)
+            else None,
+        )
+        tile_count += 1
+
+    if tile_count == 0:
+        return []
+
+    total_w = common_total_w if isinstance(common_total_w, int) and common_total_w > 0 else 1
+    total_h = common_total_h if isinstance(common_total_h, int) and common_total_h > 0 else 1
+    cols, rows = _infer_tile_grid(tile_count, total_w, total_h)
+    tile_w = max(1, total_w // max(1, cols))
+    tile_h = max(1, total_h // max(1, rows))
+    array["cols"] = cols
+    array["rows"] = rows
+    array["tile_width"] = tile_w
+    array["tile_height"] = tile_h
+    array["total_width"] = total_w
+    array["total_height"] = total_h
+
+    finalized = _finalize_tile_array_record(array)
+    return [finalized] if finalized is not None else []
+
+
+def _parse_tile_arrays(
+    data: bytes,
+) -> list[dict[str, object]]:
+    """Parse tile-array metadata from explicit text commands only."""
+    return _parse_text_tile_arrays(data)
+
+
+def _parse_text_tile_arrays(
+    data: bytes,
+) -> list[dict[str, object]]:
     try:
         text = data.decode("latin-1")
     except UnicodeDecodeError:
@@ -1383,6 +2263,8 @@ def _parse_text_tile_arrays(data: bytes) -> list[dict[str, object]]:
         if command == "BEGTILEARRAY":
             numbers = _extract_text_numbers(statement)
             if len(numbers) >= 14:
+                # numbers[3] is CellPathDirection (0=right, 90=up, 180=left, 270=down)
+                cell_path = round(numbers[3])
                 cols = max(1, round(numbers[4]))
                 rows = max(1, round(numbers[5]))
                 tile_w = max(1, round(numbers[6]))
@@ -1390,44 +2272,61 @@ def _parse_text_tile_arrays(data: bytes) -> list[dict[str, object]]:
                 total_w = max(1, round(numbers[-2]))
                 total_h = max(1, round(numbers[-1]))
             else:
-                cols, rows, tile_w, tile_h, total_w, total_h = 1, 1, 1, 1, 1, 1
+                cell_path, cols, rows, tile_w, tile_h, total_w, total_h = 0, 1, 1, 1, 1, 1, 1
 
-            current = {
-                "cols": cols,
-                "rows": rows,
-                "tile_width": tile_w,
-                "tile_height": tile_h,
-                "total_width": total_w,
-                "total_height": total_h,
-                "tiles": [],
-            }
+            current = _make_tile_array_record(
+                cols=cols,
+                rows=rows,
+                tile_width=tile_w,
+                tile_height=tile_h,
+                total_width=total_w,
+                total_height=total_h,
+                cell_path=cell_path,
+            )
             continue
 
-        if command == "BITONALTILE" and current is not None:
+        if command in _TEXT_TILE_COMMAND_FAMILY and current is not None:
             payload = _extract_hex_payload(statement)
             if payload:
-                numbers = _extract_text_numbers(statement)
+                metadata_prefix = statement.split("''", 1)[0].split('""', 1)[0]
+                numbers = _extract_text_numbers(metadata_prefix)
                 compression = round(numbers[0]) if numbers else None
+                # For BITONALTILE/MONOCHROMETILE, position 1 is the row-padding
+                # indicator (bits of padding per row), not a colour precision.
+                # Only assign local_color_precision for colour tile commands.
+                _is_bitonal_cmd = command in {"BITONALTILE", "MONOCHROMETILE"}
+                # For bitonal/monochrome tiles, numbers[1] is the row-padding indicator
+                # (bits appended per compressed row for alignment), not colour precision.
+                row_padding = round(numbers[1]) if _is_bitonal_cmd and len(numbers) >= 2 else None
+                local_color_precision = (
+                    None if _is_bitonal_cmd else (round(numbers[1]) if len(numbers) >= 2 else None)
+                )
                 bit_order = round(numbers[2]) if len(numbers) >= 3 else None
                 orientation = round(numbers[3]) if len(numbers) >= 4 else None
-                cast_tiles = current["tiles"]
-                if isinstance(cast_tiles, list):
-                    cast_tiles.append(
-                        {
-                            "payload": payload,
-                            "compression": compression,
-                            "bit_order": bit_order,
-                            "orientation": orientation,
-                        }
-                    )
+                cell_representation_mode = round(numbers[4]) if len(numbers) >= 5 else None
+                _append_tile_record(
+                    current,
+                    payload=payload,
+                    compression=compression,
+                    bit_order=bit_order,
+                    orientation=orientation,
+                    family=_TEXT_TILE_COMMAND_FAMILY[command],
+                    local_color_precision=local_color_precision,
+                    cell_representation_mode=cell_representation_mode,
+                    row_padding=row_padding,
+                )
             continue
 
         if command == "ENDTILEARRAY" and current is not None:
-            arrays.append(current)
+            finalized = _finalize_tile_array_record(current)
+            if finalized is not None:
+                arrays.append(finalized)
             current = None
 
     if current is not None:
-        arrays.append(current)
+        finalized = _finalize_tile_array_record(current)
+        if finalized is not None:
+            arrays.append(finalized)
 
     return arrays
 
@@ -1439,6 +2338,7 @@ def _decode_bitonal_payload_to_image(
     *,
     compression: int | None = None,
     bit_order: int | None = None,
+    row_padding: int | None = None,
 ) -> Image.Image | None:
     image, _details = _decode_bitonal_payload_with_details(
         payload,
@@ -1446,8 +2346,144 @@ def _decode_bitonal_payload_to_image(
         height,
         compression=compression,
         bit_order=bit_order,
+        row_padding=row_padding,
     )
     return image
+
+
+def _decode_tile_payload_to_image(
+    payload: bytes,
+    width: int,
+    height: int,
+    *,
+    compression: int | None = None,
+    bit_order: int | None = None,
+    family: str | None = None,
+    local_color_precision: int | None = None,
+    cell_representation_mode: int | None = None,
+    indexed_palette: bytes | None = None,
+    color_value_extent: tuple[int, int, int, int, int, int] | None = None,
+    row_padding: int | None = None,
+    orientation: int | None = None,
+) -> Image.Image | None:
+    """Decode tile payloads across bitonal and direct-color encodings."""
+    if Image is None or width <= 0 or height <= 0:
+        return None
+
+    total = width * height
+
+    if family == "indexed" and len(payload) >= total:
+        image = Image.frombytes("P", (width, height), payload[:total])
+        palette = (
+            indexed_palette
+            if isinstance(indexed_palette, (bytes, bytearray)) and len(indexed_palette) >= 256 * 3
+            else bytes(channel for value in range(256) for channel in (value, value, value))
+        )
+        image.putpalette(palette)
+        return image
+
+    # Honor explicit safe color-precision hints first when available.
+    if local_color_precision == 32 and len(payload) >= total * 4:
+        return Image.frombytes("RGBA", (width, height), payload[: total * 4])
+
+    if local_color_precision == 16:
+        scaled_rgb = _scale_direct16_rgb_payload(
+            payload,
+            total,
+            color_value_extent=color_value_extent,
+        )
+        if scaled_rgb is not None:
+            return Image.frombytes("RGB", (width, height), scaled_rgb)
+
+    if local_color_precision == 24 and len(payload) >= total * 3:
+        return Image.frombytes("RGB", (width, height), payload[: total * 3])
+
+    if (
+        isinstance(local_color_precision, int)
+        and local_color_precision <= 8
+        and len(payload) >= total
+        and family is None
+        and (cell_representation_mode in (None, 0, 1))
+    ):
+        image = Image.frombytes("P", (width, height), payload[:total])
+        palette = (
+            indexed_palette
+            if isinstance(indexed_palette, (bytes, bytearray)) and len(indexed_palette) >= 256 * 3
+            else bytes(channel for value in range(256) for channel in (value, value, value))
+        )
+        image.putpalette(palette)
+        return image
+
+    image = _decode_bitonal_payload_to_image(
+        payload,
+        width,
+        height,
+        compression=compression,
+        bit_order=bit_order,
+        row_padding=row_padding,
+    )
+    if image is not None:
+        return _apply_tile_orientation(image, orientation)
+
+    if len(payload) >= total * 4:
+        return _apply_tile_orientation(
+            Image.frombytes("RGBA", (width, height), payload[: total * 4]), orientation
+        )
+
+    if len(payload) >= total * 3:
+        return _apply_tile_orientation(
+            Image.frombytes("RGB", (width, height), payload[: total * 3]), orientation
+        )
+
+    if len(payload) >= total * 2:
+        # Common 16-bit grayscale payloads can be approximated by high bytes.
+        gray16 = payload[: total * 2]
+        gray8 = bytes(gray16[idx] for idx in range(0, len(gray16), 2))
+        return _apply_tile_orientation(Image.frombytes("L", (width, height), gray8), orientation)
+
+    if len(payload) >= total:
+        sample = payload[:total]
+        unique = set(sample)
+        if unique.issubset({0, 1}):
+            sample = bytes(0 if value else 255 for value in sample)
+        return _apply_tile_orientation(Image.frombytes("L", (width, height), sample), orientation)
+
+    return None
+
+
+def _apply_tile_orientation(image: Image.Image, orientation: int | None) -> Image.Image:
+    """Apply CGM BITONALTILE orientation transform to a decoded tile image.
+
+    Currently a no-op — the orientation field is stored in the tile record but
+    not applied here because the CGM rendering pipeline (VDC coordinate mapping
+    and raster tile placement) already produces the correct on-screen orientation
+    without an additional image flip.  The parameter is retained for future use
+    if files that require an explicit transform are encountered.
+    """
+    return image
+
+
+def _find_t6_eofb_bit_offset(payload: bytes) -> int | None:
+    """Return the bit offset of the T.6 EOFB marker in *payload*, or None.
+
+    The EOFB is two consecutive 12-bit strings ``000000000001`` (= 24 bits,
+    hex ``0x001001``).  It is searched only in the last 16 bytes of the
+    payload — a practical optimisation that covers all well-formed streams.
+    """
+    n = len(payload)
+    if n < 3:
+        return None
+    # Search only the last 16 bytes to stay fast.
+    start_byte = max(0, n - 16)
+    for byte_idx in range(start_byte, n - 2):
+        # Load 4 bytes as a big-endian integer (zero-pad at the end).
+        chunk_bytes = payload[byte_idx : min(byte_idx + 4, n)]
+        chunk = int.from_bytes(chunk_bytes.ljust(4, b"\x00"), "big")
+        for bit_off in range(8):
+            window = (chunk >> (8 - bit_off)) & 0xFFFFFF
+            if window == 0x001001:
+                return byte_idx * 8 + bit_off
+    return None
 
 
 def _decode_bitonal_payload_with_details(
@@ -1457,10 +2493,10 @@ def _decode_bitonal_payload_with_details(
     *,
     compression: int | None = None,
     bit_order: int | None = None,
+    row_padding: int | None = None,
     preferred_signature: tuple[str, str, bool] | None = None,
     preferred_dimensions: tuple[int, int] | None = None,
 ) -> tuple[Image.Image | None, dict[str, object]]:
-    preferred_score_tolerance = 0.03
     if Image is None or imagecodecs is None or width <= 0 or height <= 0:
         return None, {
             "best_score": None,
@@ -1469,210 +2505,306 @@ def _decode_bitonal_payload_with_details(
             "attempts": [],
         }
 
-    best_bits: list[int] | None = None
-    best_score = 1e9
-    best_candidate: dict[str, object] | None = None
-    best_preferred_bits: list[int] | None = None
-    best_preferred_score = 1e9
-    best_preferred_candidate: dict[str, object] | None = None
-    attempts: list[dict[str, object]] = []
-
-    width_candidates = [width]
-    if width > 2:
-        width_candidates.extend([width - 1, width + 1])
-    height_candidates = [height]
-    if height > 2:
-        height_candidates.extend([height - 1, height + 1])
-
-    size_candidates: list[tuple[int, int]] = []
-    seen_sizes: set[tuple[int, int]] = set()
-    for cand_w in width_candidates:
-        for cand_h in height_candidates:
-            key = (cand_w, cand_h)
-            if key in seen_sizes or cand_w <= 0 or cand_h <= 0:
-                continue
-            seen_sizes.add(key)
-            size_candidates.append(key)
-
-    payload_candidates = _payload_variants(payload)
-    if bit_order == 1 and len(payload_candidates) > 1:
-        payload_candidates = [payload_candidates[1], payload_candidates[0]]
-
-    for encoded in payload_candidates:
-        encoded_variant = "bit_reversed" if encoded != payload else "as_is"
-
-        # Some profiles store uncompressed packed bits; attempt this path too.
+    if compression == 0:
         row_bytes = (width + 7) // 8
-        packed_needed = row_bytes * height
-        if len(encoded) >= packed_needed:
-            packed_bits = _decode_fax_output_to_bitmap(encoded, width, height)
-            if packed_bits is not None:
-                for invert in (False, True):
-                    candidate = [1 - bit for bit in packed_bits] if invert else packed_bits
-                    score = _score_bitmap(candidate, width, height)
-                    if compression == 0:
-                        score -= 0.2
-                    signature = ("packed_raw", encoded_variant, invert)
-                    attempts.append(
-                        {
-                            "decoder": "packed_raw",
-                            "encoded_variant": encoded_variant,
-                            "width": width,
-                            "height": height,
-                            "invert": invert,
-                            "score": round(score, 6),
-                        }
-                    )
-                    if score < best_score:
-                        best_score = score
-                        best_bits = candidate
-                        best_candidate = {
-                            "decoder": "packed_raw",
-                            "encoded_variant": encoded_variant,
-                            "width": width,
-                            "height": height,
-                            "invert": invert,
-                            "score": round(score, 6),
-                        }
-                    if preferred_signature is not None and signature == preferred_signature:
-                        if preferred_dimensions is not None and preferred_dimensions != (
-                            width,
-                            height,
-                        ):
-                            continue
-                        if score < best_preferred_score:
-                            best_preferred_score = score
-                            best_preferred_bits = candidate
-                            best_preferred_candidate = {
-                                "decoder": "packed_raw",
-                                "encoded_variant": encoded_variant,
-                                "width": width,
-                                "height": height,
-                                "invert": invert,
-                                "score": round(score, 6),
-                            }
+        needed = row_bytes * height
+        if len(payload) < needed:
+            return None, {
+                "best_score": None,
+                "candidate_count": 0,
+                "best_candidate": None,
+                "preferred_signature": preferred_signature,
+                "preferred_dimensions": preferred_dimensions,
+                "used_preferred_signature": False,
+                "attempts": [],
+            }
 
-        for cand_w, cand_h in size_candidates:
-            decode_attempts: list[tuple[str, bytes]] = []
-            # Respect declared compression when present to avoid pathological brute-force loops.
-            allow_fax4 = compression in (None, 2)
-            allow_fax3 = compression in (None, 1)
+        bits: list[int] = []
+        packed = payload[:needed]
+        if bit_order == 1:
+            packed = bytes(_reverse_bits_in_byte(byte) for byte in packed)
+        for y in range(height):
+            row_start = y * row_bytes
+            for x in range(width):
+                value = packed[row_start + (x // 8)]
+                bits.append((value >> (7 - (x % 8))) & 1)
 
-            if allow_fax4:
-                try:
-                    decode_attempts.append(
-                        (
-                            "fax4",
-                            bytes(
-                                imagecodecs.ccittfax4_decode(encoded, height=cand_h, width=cand_w)
-                            ),
-                        )
-                    )
-                except (RuntimeError, ValueError):
-                    pass
-
-            if allow_fax3:
-                for t4options in (0, 2, 4, 6, 1, 3, 5, 7):
-                    try:
-                        decoded = imagecodecs.ccittfax3_decode(
-                            encoded,
-                            height=cand_h,
-                            width=cand_w,
-                            t4options=t4options,
-                        )
-                        decode_attempts.append((f"fax3:{t4options}", bytes(decoded)))
-                    except (RuntimeError, ValueError):
-                        continue
-
-            for decoder_name, decoded in decode_attempts:
-                bits = _decode_fax_output_to_bitmap(decoded, cand_w, cand_h)
-                if bits is None:
-                    continue
-
-                if cand_w != width or cand_h != height:
-                    tmp_pixels = bytes(0 if bit else 255 for bit in bits)
-                    tmp_img = Image.frombytes("L", (cand_w, cand_h), tmp_pixels)
-                    tmp_img = tmp_img.resize((width, height), resample=Image.NEAREST)
-                    bits = [1 if value == 0 else 0 for value in tmp_img.tobytes()]
-
-                for invert in (False, True):
-                    candidate = [1 - bit for bit in bits] if invert else bits
-                    score = _score_bitmap(candidate, width, height)
-                    if compression in (1, 2):
-                        score -= 0.05
-                    signature = (decoder_name, encoded_variant, invert)
-                    attempts.append(
-                        {
-                            "decoder": decoder_name,
-                            "encoded_variant": encoded_variant,
-                            "width": cand_w,
-                            "height": cand_h,
-                            "invert": invert,
-                            "score": round(score, 6),
-                        }
-                    )
-                    if score < best_score:
-                        best_score = score
-                        best_bits = candidate
-                        best_candidate = {
-                            "decoder": decoder_name,
-                            "encoded_variant": encoded_variant,
-                            "width": cand_w,
-                            "height": cand_h,
-                            "invert": invert,
-                            "score": round(score, 6),
-                        }
-                    if preferred_signature is not None and signature == preferred_signature:
-                        if preferred_dimensions is not None and preferred_dimensions != (
-                            cand_w,
-                            cand_h,
-                        ):
-                            continue
-                        if score < best_preferred_score:
-                            best_preferred_score = score
-                            best_preferred_bits = candidate
-                            best_preferred_candidate = {
-                                "decoder": decoder_name,
-                                "encoded_variant": encoded_variant,
-                                "width": cand_w,
-                                "height": cand_h,
-                                "invert": invert,
-                                "score": round(score, 6),
-                            }
-
-    use_preferred = False
-    if preferred_signature is not None and best_preferred_bits is not None:
-        # Keep global consistency only when it does not materially degrade local decode quality.
-        if best_bits is None or best_preferred_score <= (best_score + preferred_score_tolerance):
-            use_preferred = True
-    selected_bits = best_preferred_bits if use_preferred else best_bits
-    selected_score = best_preferred_score if use_preferred else best_score
-    selected_candidate = best_preferred_candidate if use_preferred else best_candidate
-
-    if selected_bits is None:
-        return None, {
+        pixels = bytes(0 if bit else 255 for bit in bits)
+        return Image.frombytes("L", (width, height), pixels), {
             "best_score": None,
-            "candidate_count": len(attempts),
-            "best_candidate": None,
+            "candidate_count": 1,
+            "best_candidate": {
+                "decoder": "packed_raw",
+                "encoded_variant": "as_is",
+                "width": width,
+                "height": height,
+                "invert": False,
+                "score": None,
+            },
             "preferred_signature": preferred_signature,
             "preferred_dimensions": preferred_dimensions,
             "used_preferred_signature": False,
-            "attempts": attempts,
+            "attempts": [
+                {
+                    "decoder": "packed_raw",
+                    "encoded_variant": "as_is",
+                    "width": width,
+                    "height": height,
+                    "invert": False,
+                    "score": None,
+                }
+            ],
         }
 
-    pixels = bytes(0 if bit else 255 for bit in selected_bits)
-    return Image.frombytes("L", (width, height), pixels), {
-        "best_score": round(selected_score, 6),
-        "candidate_count": len(attempts),
-        "best_candidate": selected_candidate,
+    if compression == 1:
+        try:
+            decoded = bytes(imagecodecs.ccittfax3_decode(payload, height=height, width=width))
+        except (RuntimeError, ValueError):
+            return None, {
+                "best_score": None,
+                "candidate_count": 0,
+                "best_candidate": None,
+                "preferred_signature": preferred_signature,
+                "preferred_dimensions": preferred_dimensions,
+                "used_preferred_signature": False,
+                "attempts": [],
+            }
+        decoded_bits = _decode_fax_output_to_bitmap(decoded, width, height)
+        if decoded_bits is None:
+            return None, {
+                "best_score": None,
+                "candidate_count": 0,
+                "best_candidate": None,
+                "preferred_signature": preferred_signature,
+                "preferred_dimensions": preferred_dimensions,
+                "used_preferred_signature": False,
+                "attempts": [],
+            }
+        pixels = bytes(0 if bit else 255 for bit in decoded_bits)
+        return Image.frombytes("L", (width, height), pixels), {
+            "best_score": None,
+            "candidate_count": 1,
+            "best_candidate": {
+                "decoder": "fax3:exact",
+                "encoded_variant": "as_is",
+                "width": width,
+                "height": height,
+                "invert": False,
+                "score": None,
+            },
+            "preferred_signature": preferred_signature,
+            "preferred_dimensions": preferred_dimensions,
+            "used_preferred_signature": False,
+            "attempts": [
+                {
+                    "decoder": "fax3:exact",
+                    "encoded_variant": "as_is",
+                    "width": width,
+                    "height": height,
+                    "invert": False,
+                    "score": None,
+                }
+            ],
+        }
+
+    if compression == 2:
+        # Use the T.6 EOFB position to validate the nominal decode before
+        # attempting any width-adjustment trial.
+        #
+        # The EOFB marker (000000000001 000000000001) appears at the end of the
+        # T.6 bitstream.  Its position tells us how many rows are actually encoded:
+        #
+        #   • EOFB near the end of the payload  → all *height* rows are encoded;
+        #     trailing all-white rows in the decoded image are legitimate (drawn
+        #     empty areas), not imagecodecs fill.  No width adjustment is needed
+        #     if the nominal decode already has zero solid-black-row artifacts.
+        #
+        #   • No EOFB found or EOFB early in the payload  → stream may be
+        #     incomplete or the nominal decode is consuming extra padding bits
+        #     as data.  Apply the multi-width trial with truncation guard.
+        #
+        # T.6 (G4) rows may also have alignment padding appended per the
+        # row_padding field.  The multi-width trial (below) compensates by
+        # trying three decode widths and choosing the one that best balances:
+        #   sbr  - solid-black rows  (>95 % black): T.6 misalignment artifact
+        #   twr  - trailing all-white rows: stream depleted early by a wider
+        #          decode width consuming too many bits per row
+        _eofb_bit = _find_t6_eofb_bit_offset(payload)
+        _payload_bits = len(payload) * 8
+        # "Near end" = EOFB within the last 20 % of payload bits.
+        _eofb_near_end = _eofb_bit is not None and _eofb_bit >= _payload_bits * 0.8
+
+        _try_widths: list[int] = [width]
+        if isinstance(row_padding, int) and row_padding > 8:
+            # Try width + row_padding//2.  The full width + row_padding often
+            # depletes the bitstream early (truncation); the half-padding value
+            # is a better approximation of the average per-row alignment cost
+            # and avoids introducing new trailing-white artefacts.
+            _try_widths.append(width + row_padding // 2)
+        elif isinstance(row_padding, int) and 0 < row_padding <= 8:
+            _try_widths.append(width + row_padding)
+        # Deduplicate while preserving order.
+        _seen_w: set[int] = set()
+        _unique_widths: list[int] = []
+        for _w in _try_widths:
+            if _w not in _seen_w:
+                _seen_w.add(_w)
+                _unique_widths.append(_w)
+
+        def _fax4_try(w: int) -> tuple[Image.Image | None, int, int]:
+            """Decode at width w; return (image, sbr, twr) or (None, large, large)."""
+            _inf = height + 1
+            try:
+                _raw = bytes(imagecodecs.ccittfax4_decode(payload, height=height, width=w))
+            except (RuntimeError, ValueError):
+                return None, _inf, _inf
+            if w > width:
+                _stripped = bytearray()
+                for _r in range(height):
+                    _stripped.extend(_raw[_r * w : _r * w + width])
+                _raw = bytes(_stripped)
+            _bits = _decode_fax_output_to_bitmap(_raw, width, height)
+            if _bits is None:
+                return None, _inf, _inf
+            # Solid-black-row count (T.6 misalignment artifact).
+            _sbr = sum(
+                1
+                for _r in range(height)
+                if sum(_bits[_r * width : (_r + 1) * width]) / width > 0.95
+            )
+            # Trailing contiguous all-white rows (truncation artifact).
+            _twr = 0
+            for _r in range(height - 1, -1, -1):
+                if sum(_bits[_r * width : (_r + 1) * width]) == 0:
+                    _twr += 1
+                else:
+                    break
+            _px = bytes(0 if b else 255 for b in _bits)
+            return Image.frombytes("L", (width, height), _px), _sbr, _twr
+
+        # Collect scored candidates.
+        _candidates: list[tuple[int, Image.Image, int, int]] = []  # (w, img, sbr, twr)
+
+        # EOFB-based fast path: if the EOFB is near the end of the payload the
+        # nominal width is row-count correct.  Decode at the nominal width first;
+        # return immediately only if the decode is completely clean (sbr=0).
+        # Any non-zero sbr, however small, still warrants trying the alternative
+        # half-padding width — some tiles have genuine T.6 row-alignment drift
+        # that produces 10-25 solid-black rows which the +P/2 width eliminates.
+        if _eofb_near_end:
+            _nom_img, _nom_sbr, _nom_twr = _fax4_try(width)
+            if _nom_img is not None:
+                _candidates.append((width, _nom_img, _nom_sbr, _nom_twr))
+                if _nom_sbr == 0 and _nom_twr == 0:
+                    # Nominal decode is completely clean — skip alternative widths.
+                    return _nom_img, {
+                        "best_score": None,
+                        "candidate_count": 1,
+                        "best_candidate": {
+                            "decoder": "fax4",
+                            "encoded_variant": "as_is",
+                            "width": width,
+                            "height": height,
+                            "invert": False,
+                            "score": None,
+                        },
+                        "preferred_signature": preferred_signature,
+                        "preferred_dimensions": preferred_dimensions,
+                        "used_preferred_signature": False,
+                        "attempts": [
+                            {
+                                "decoder": "fax4",
+                                "encoded_variant": "as_is",
+                                "width": width,
+                                "height": height,
+                                "invert": False,
+                                "score": None,
+                            }
+                        ],
+                    }
+            # Nominal has sbr > 0 despite EOFB being valid — may be T.6 misalignment;
+            # try the alternative half-padding width.
+            for _w in _unique_widths[1:]:
+                _img, _sbr, _twr = _fax4_try(_w)
+                if _img is not None:
+                    _candidates.append((_w, _img, _sbr, _twr))
+        else:
+            for _w in _unique_widths:
+                _img, _sbr, _twr = _fax4_try(_w)
+                if _img is not None:
+                    _candidates.append((_w, _img, _sbr, _twr))
+
+        if not _candidates:
+            return None, {
+                "best_score": None,
+                "candidate_count": 0,
+                "best_candidate": None,
+                "preferred_signature": preferred_signature,
+                "preferred_dimensions": preferred_dimensions,
+                "used_preferred_signature": False,
+                "attempts": [],
+            }
+
+        # Baseline truncation level from the nominal width decode.
+        _nom = next((_twr for _w, _, _sbr, _twr in _candidates if _w == width), height)
+        _max_twr = _nom + max(1, height // 10)
+
+        # Keep only candidates that don't introduce significantly more truncation
+        # than the nominal decode.
+        _valid = [
+            (_w, _img, _sbr, _twr) for _w, _img, _sbr, _twr in _candidates if _twr <= _max_twr
+        ]
+        if not _valid:
+            # All padded widths cause truncation; fall back to the nominal decode.
+            _valid = [(_w, _img, _sbr, _twr) for _w, _img, _sbr, _twr in _candidates if _w == width]
+
+        # Among valid candidates pick the one with fewest artifact rows, breaking
+        # ties by preferring less truncation.
+        _, _best_img, _, _ = min(_valid, key=lambda t: (t[2], t[3]))
+
+        return _best_img, {
+            "best_score": None,
+            "candidate_count": 1,
+            "best_candidate": {
+                "decoder": "fax4",
+                "encoded_variant": "as_is",
+                "width": width,
+                "height": height,
+                "invert": False,
+                "score": None,
+            },
+            "preferred_signature": preferred_signature,
+            "preferred_dimensions": preferred_dimensions,
+            "used_preferred_signature": False,
+            "attempts": [
+                {
+                    "decoder": "fax4",
+                    "encoded_variant": "as_is",
+                    "width": width,
+                    "height": height,
+                    "invert": False,
+                    "score": None,
+                }
+            ],
+        }
+
+    return None, {
+        "best_score": None,
+        "candidate_count": 0,
+        "best_candidate": None,
         "preferred_signature": preferred_signature,
         "preferred_dimensions": preferred_dimensions,
-        "used_preferred_signature": use_preferred,
-        "attempts": attempts,
+        "used_preferred_signature": False,
+        "attempts": [],
     }
 
 
-def _render_raw_image_payload(image: RawImage) -> Image.Image | None:
+def _render_raw_image_payload(
+    image: RawImage,
+    *,
+    indexed_palette: bytes | None = None,
+    color_value_extent: tuple[int, int, int, int, int, int] | None = None,
+) -> Image.Image | None:
     if Image is None or image.width is None or image.height is None:
         return None
 
@@ -1682,6 +2814,47 @@ def _render_raw_image_payload(image: RawImage) -> Image.Image | None:
         return None
 
     total = width * height
+
+    if (
+        isinstance(image.local_color_precision, int)
+        and image.local_color_precision <= 8
+        and len(image.payload) >= total
+        and (image.cell_representation_mode in (None, 0, 1))
+    ):
+        indexed = Image.frombytes("P", (width, height), image.payload[:total])
+        palette = (
+            indexed_palette
+            if isinstance(indexed_palette, (bytes, bytearray)) and len(indexed_palette) >= 256 * 3
+            else bytes(channel for value in range(256) for channel in (value, value, value))
+        )
+        indexed.putpalette(palette)
+        return indexed
+
+    if image.local_color_precision == 32 and len(image.payload) >= total * 4:
+        rgba = image.payload[: total * 4]
+        return Image.frombytes("RGBA", (width, height), rgba)
+
+    if image.local_color_precision == 16:
+        scaled_rgb = _scale_direct16_rgb_payload(
+            image.payload,
+            total,
+            color_value_extent=color_value_extent,
+        )
+        if scaled_rgb is not None:
+            return Image.frombytes("RGB", (width, height), scaled_rgb)
+
+    if image.local_color_precision == 24 and len(image.payload) >= total * 3:
+        rgb = image.payload[: total * 3]
+        return Image.frombytes("RGB", (width, height), rgb)
+
+    if len(image.payload) >= total * 4:
+        rgba = image.payload[: total * 4]
+        return Image.frombytes("RGBA", (width, height), rgba)
+
+    if len(image.payload) >= total * 3:
+        rgb = image.payload[: total * 3]
+        return Image.frombytes("RGB", (width, height), rgb)
+
     if len(image.payload) >= total:
         sample = image.payload[:total]
         unique = set(sample)
@@ -1706,17 +2879,63 @@ def _render_raw_image_payload(image: RawImage) -> Image.Image | None:
     return None
 
 
-def _render_first_text_tile_array(data: bytes) -> Image.Image | None:
+def _coerce_int(value: object, default: int = 1) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return default
+        try:
+            return int(stripped)
+        except ValueError:
+            return default
+    return default
+
+
+def _tile_row_col(tile_index: int, cols: int, rows: int, cell_path: int) -> tuple[int, int]:
+    """Map a flat tile index to (row, col) respecting CGM CellPath direction.
+
+    CellPath values:
+      0 / 360  right (row-major, left→right then top→bottom)
+      90       up   (column-major, bottom→top then left→right)
+      180      left (row-major, right→left then top→bottom)
+      270      down (column-major, top→bottom then left→right)
+    """
+    if cell_path in (90, 270):
+        # Column-major: tiles traverse rows within a column first.
+        col = tile_index // rows
+        row_in_col = tile_index % rows
+        row = (rows - 1 - row_in_col) if cell_path == 90 else row_in_col
+    else:
+        # Row-major (cell_path 0, 180, or default).
+        row = tile_index // cols
+        col_in_row = tile_index % cols
+        col = (cols - 1 - col_in_row) if cell_path == 180 else col_in_row
+    return row, col
+
+
+def _render_first_tile_array(
+    data: bytes,
+) -> Image.Image | None:
     if Image is None:
         return None
 
-    for array in _parse_text_tile_arrays(data):
-        cols = int(array.get("cols", 1))
-        rows = int(array.get("rows", 1))
-        tile_w_nominal = int(array.get("tile_width", 1))
-        tile_h_nominal = int(array.get("tile_height", 1))
-        total_w = int(array.get("total_width", 1))
-        total_h = int(array.get("total_height", 1))
+    indexed_palette = _indexed_palette_bytes(_extract_color_table(data))
+    color_value_extent = _extract_color_value_extent(data)
+
+    for array in _parse_tile_arrays(data):
+        cols = _coerce_int(array.get("cols", 1))
+        rows = _coerce_int(array.get("rows", 1))
+        tile_w_nominal = _coerce_int(array.get("tile_width", 1))
+        tile_h_nominal = _coerce_int(array.get("tile_height", 1))
+        total_w = _coerce_int(array.get("total_width", 1))
+        total_h = _coerce_int(array.get("total_height", 1))
+        # cell_path = _coerce_int(array.get("cell_path", 0))
         tiles = array.get("tiles", [])
         if not isinstance(tiles, list) or not tiles:
             continue
@@ -1734,12 +2953,29 @@ def _render_first_text_tile_array(data: bytes) -> Image.Image | None:
             if not isinstance(payload, (bytes, bytearray)):
                 continue
 
-            tile_img = _decode_bitonal_payload_to_image(
+            tile_img = _decode_tile_payload_to_image(
                 bytes(payload),
                 tile_w_nominal,
                 tile_h_nominal,
                 compression=compression if isinstance(compression, int) else None,
                 bit_order=bit_order if isinstance(bit_order, int) else None,
+                family=tile_payload.get("family")
+                if isinstance(tile_payload.get("family"), str)
+                else None,
+                local_color_precision=tile_payload.get("local_color_precision")
+                if isinstance(tile_payload.get("local_color_precision"), int)
+                else None,
+                cell_representation_mode=tile_payload.get("cell_representation_mode")
+                if isinstance(tile_payload.get("cell_representation_mode"), int)
+                else None,
+                row_padding=tile_payload.get("row_padding")
+                if isinstance(tile_payload.get("row_padding"), int)
+                else None,
+                orientation=tile_payload.get("orientation")
+                if isinstance(tile_payload.get("orientation"), int)
+                else None,
+                indexed_palette=indexed_palette,
+                color_value_extent=color_value_extent,
             )
             if tile_img is None:
                 continue
@@ -1768,15 +3004,110 @@ def _render_first_text_tile_array(data: bytes) -> Image.Image | None:
     return None
 
 
-def _render_raster_background_data_uri(data: bytes) -> tuple[str, int, int] | None:
-    tiled = _render_first_text_tile_array(data)
+def _render_first_tile_array_overlays(
+    data: bytes,
+) -> tuple[list[tuple[str, float, float, float, float]], int, int] | None:
+    """Decode first available tile array and return per-tile SVG overlays."""
+    indexed_palette = _indexed_palette_bytes(_extract_color_table(data))
+    color_value_extent = _extract_color_value_extent(data)
+
+    for array in _parse_tile_arrays(data):
+        cols = _coerce_int(array.get("cols", 1))
+        rows = _coerce_int(array.get("rows", 1))
+        tile_w_nominal = _coerce_int(array.get("tile_width", 1))
+        tile_h_nominal = _coerce_int(array.get("tile_height", 1))
+        total_w = _coerce_int(array.get("total_width", 1))
+        total_h = _coerce_int(array.get("total_height", 1))
+        # cell_path = _coerce_int(array.get("cell_path", 0))
+        tiles = array.get("tiles", [])
+        if not isinstance(tiles, list) or not tiles:
+            continue
+
+        overlays: list[tuple[str, float, float, float, float]] = []
+
+        for tile_index, tile_payload in enumerate(tiles[: rows * cols]):
+            if not isinstance(tile_payload, dict):
+                continue
+
+            payload = tile_payload.get("payload")
+            compression = tile_payload.get("compression")
+            bit_order = tile_payload.get("bit_order")
+            if not isinstance(payload, (bytes, bytearray)):
+                continue
+
+            tile_img = _decode_tile_payload_to_image(
+                bytes(payload),
+                tile_w_nominal,
+                tile_h_nominal,
+                compression=compression if isinstance(compression, int) else None,
+                bit_order=bit_order if isinstance(bit_order, int) else None,
+                family=tile_payload.get("family")
+                if isinstance(tile_payload.get("family"), str)
+                else None,
+                local_color_precision=tile_payload.get("local_color_precision")
+                if isinstance(tile_payload.get("local_color_precision"), int)
+                else None,
+                cell_representation_mode=tile_payload.get("cell_representation_mode")
+                if isinstance(tile_payload.get("cell_representation_mode"), int)
+                else None,
+                row_padding=tile_payload.get("row_padding")
+                if isinstance(tile_payload.get("row_padding"), int)
+                else None,
+                orientation=tile_payload.get("orientation")
+                if isinstance(tile_payload.get("orientation"), int)
+                else None,
+                indexed_palette=indexed_palette,
+                color_value_extent=color_value_extent,
+            )
+            if tile_img is None:
+                continue
+
+            row = tile_index // cols
+            col = tile_index % cols
+            x = col * tile_w_nominal
+            y = row * tile_h_nominal
+            if x >= total_w or y >= total_h:
+                continue
+
+            paste_w = min(tile_img.width, total_w - x)
+            paste_h = min(tile_img.height, total_h - y)
+            if paste_w <= 0 or paste_h <= 0:
+                continue
+
+            tile_for_svg = tile_img
+            if tile_img.size != (paste_w, paste_h):
+                tile_for_svg = tile_img.crop((0, 0, paste_w, paste_h))
+
+            href = _image_to_png_data_uri(tile_for_svg)
+            if href is None:
+                continue
+
+            overlays.append((href, float(x), float(y), float(paste_w), float(paste_h)))
+
+        if overlays:
+            return overlays, total_w, total_h
+
+    return None
+
+
+def _render_raster_background_data_uri(
+    data: bytes,
+) -> tuple[str, int, int] | None:
+    tiled = _render_first_tile_array(data)
     if tiled is not None:
         href = _image_to_png_data_uri(tiled)
         if href is not None:
             return href, tiled.width, tiled.height
 
+    indexed_palette = _indexed_palette_bytes(_extract_color_table(data))
+    color_value_extent = _extract_color_value_extent(data)
+
     for image in extract_raw_images_from_bytes(data):
-        rendered = _render_raw_image_payload(image)
+        rendered = _render_raw_image_payload(
+            image,
+            indexed_palette=indexed_palette,
+            color_value_extent=color_value_extent,
+        )
         if rendered is None:
             continue
         href = _image_to_png_data_uri(rendered)
@@ -1801,22 +3132,25 @@ def extract_rendered_images_to_directory(
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     svg_path = out_dir / f"{stem}_0000.svg"
-    svg_path.write_text(extract_vector_svg_from_bytes(raw), encoding="utf-8")
+    svg_path.write_text(
+        extract_vector_svg_from_bytes(raw),
+        encoding="utf-8",
+    )
     written.append(svg_path)
 
     if debug_report:
         arrays_report: list[dict[str, object]] = []
-        for idx, array in enumerate(_parse_text_tile_arrays(raw)):
+        for idx, array in enumerate(_parse_tile_arrays(raw)):
             tiles = array.get("tiles", [])
             arrays_report.append(
                 {
                     "array_index": idx,
-                    "cols": int(array.get("cols", 1)),
-                    "rows": int(array.get("rows", 1)),
-                    "tile_width": int(array.get("tile_width", 1)),
-                    "tile_height": int(array.get("tile_height", 1)),
-                    "total_width": int(array.get("total_width", 1)),
-                    "total_height": int(array.get("total_height", 1)),
+                    "cols": _coerce_int(array.get("cols", 1)),
+                    "rows": _coerce_int(array.get("rows", 1)),
+                    "tile_width": _coerce_int(array.get("tile_width", 1)),
+                    "tile_height": _coerce_int(array.get("tile_height", 1)),
+                    "total_width": _coerce_int(array.get("total_width", 1)),
+                    "total_height": _coerce_int(array.get("total_height", 1)),
                     "tile_count": len(tiles) if isinstance(tiles, list) else 0,
                 }
             )

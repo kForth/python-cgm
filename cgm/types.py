@@ -12,7 +12,7 @@ from pathlib import Path
 
 @dataclass(slots=True, frozen=True)
 class CGMElement:
-    """Represents one CGM element as parsed from a binary CGM stream."""
+    """Represents one CGM element parsed from a binary or clear-text CGM stream."""
 
     class_id: int
     element_id: int
@@ -22,13 +22,15 @@ class CGMElement:
 
 @dataclass(slots=True, frozen=True)
 class RawImage:
-    """Represents extracted raw raster bytes from a CGM Cell Array element."""
+    """Represents extracted raw raster bytes from a CGM Cell Array or tile element."""
 
     index: int
     element_offset: int
     payload: bytes
     width: int | None = None
     height: int | None = None
+    local_color_precision: int | None = None
+    cell_representation_mode: int | None = None
 
     def default_filename(self, *, stem: str = "image") -> str:
         """Return a deterministic filename for saving this payload."""
@@ -45,7 +47,7 @@ class RawImage:
 
 @dataclass(slots=True, frozen=True)
 class HotSpot:
-    """Represents a best-effort hotspot region found in CGM application data."""
+    """Represents a hotspot region found in CGM application data."""
 
     index: int
     source_tag: str | None
