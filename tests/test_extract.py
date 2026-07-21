@@ -25,7 +25,7 @@ from cgm.extract import (
     extract_vector_svg_from_bytes,
 )
 from cgm.extract.core import decode_restricted_text
-from cgm.extract.svg import _parse_element29_raster_prefix
+from cgm.extract.svg import _parse_element29_raster_prefix, _render_first_element29_raster
 from cgm.parser import iter_elements
 
 if TYPE_CHECKING:
@@ -799,6 +799,69 @@ def test_gr_78129_gr_78167_and_gr_78836_tiles_prefer_padded_fax4_width() -> None
         assert current is not None
         assert ImageChops.difference(nominal, padded).getbbox() is not None
         assert ImageChops.difference(current, padded).getbbox() is None
+
+
+def test_gr_single_payload_id29_2010_uses_wrapper_tile_dimensions() -> None:
+    from pathlib import Path  # noqa: PLC0415
+
+    from cgm.extract.core import decode_vdc_extent  # noqa: PLC0415
+    from cgm.extract.tiles import (  # noqa: PLC0415
+        _decode_tile_payload_to_image,
+        _parse_binary_tile_array_header,
+    )
+
+    root = Path(__file__).resolve().parents[1]
+    cases = (
+        "GR-295523.cgm",
+        "GR-265523.cgm",
+        "GR-240668.cgm",
+        "GR-227821.cgm",
+    )
+
+    for file_name in cases:
+        candidates = [
+            root / "sample" / file_name,
+            root / "test_files" / file_name,
+        ]
+        source = next((path for path in candidates if path.exists()), candidates[0])
+        extent = None
+        parsed_payload = None
+        wrapper = None
+        source_bytes = source.read_bytes()
+        for element in iter_elements(source_bytes):
+            if (element.class_id, element.element_id) == (2, 6):
+                extent = decode_vdc_extent(element.parameters)
+            if (element.class_id, element.element_id) == (0, 19):
+                wrapper = _parse_binary_tile_array_header(element.parameters)
+            if (element.class_id, element.element_id) == (4, 29):
+                parsed_payload = _parse_element29_raster_prefix(element.parameters)
+                if parsed_payload is not None:
+                    break
+
+        assert extent is not None
+        assert wrapper is not None
+        assert parsed_payload is not None
+        _compression, row_padding, bit_order, orientation, payload = parsed_payload
+        width = round(abs(extent[2] - extent[0]))
+        height = round(abs(extent[3] - extent[1]))
+        wrapper_width = int(wrapper["tile_width"])
+        wrapper_height = int(wrapper["tile_height"])
+
+        nominal = _decode_tile_payload_to_image(
+            payload,
+            width,
+            height,
+            compression=2,
+            bit_order=bit_order,
+            row_padding=row_padding,
+            orientation=orientation,
+        )
+        rendered = _render_first_element29_raster(source_bytes)
+
+        assert nominal is not None
+        assert rendered is not None
+        assert nominal.size == (width, height)
+        assert rendered.size == (wrapper_width, wrapper_height)
 
 
 def test_id29_prefix_families_have_no_new_frequent_format() -> None:

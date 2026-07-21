@@ -38,6 +38,7 @@ from cgm.extract.core import (
 from cgm.extract.tiles import (
     _decode_tile_payload_to_image,
     _infer_tile_grid,
+    _parse_binary_tile_array_header,
     _parse_tile_arrays,
     _render_first_tile_array,
 )
@@ -183,9 +184,13 @@ def _decode_element29_payload_with_fallbacks(
 
 def _collect_element29_raster_payloads(
     data: bytes,
-) -> tuple[tuple[int, int] | None, list[tuple[int, int, int, int, bytes]]]:
+) -> tuple[
+    tuple[int, int] | None,
+    list[tuple[int, int, int, int, bytes, int | None, int | None]],
+]:
     vdc_extent: tuple[float, float, float, float] | None = None
-    payloads: list[tuple[int, int, int, int, bytes]] = []
+    payloads: list[tuple[int, int, int, int, bytes, int | None, int | None]] = []
+    active_tile_header: dict[str, int] | None = None
 
     for element in iter_elements(data):
         if element.class_id == 2 and element.element_id == 6:
@@ -194,12 +199,33 @@ def _collect_element29_raster_payloads(
                 vdc_extent = decoded_extent
             continue
 
+        if element.class_id == 0 and element.element_id == 19:
+            active_tile_header = _parse_binary_tile_array_header(element.parameters)
+            continue
+
+        if element.class_id == 0 and element.element_id == 20:
+            active_tile_header = None
+            continue
+
         if element.class_id == 4 and element.element_id == 29:
             if decode_restricted_text(element.parameters) is not None:
                 continue
             parsed = _parse_element29_raster_prefix(element.parameters)
             if parsed is not None:
-                payloads.append(parsed)
+                decode_width: int | None = None
+                decode_height: int | None = None
+                if (
+                    isinstance(active_tile_header, dict)
+                    and active_tile_header.get("cols") == 1
+                    and active_tile_header.get("rows") == 1
+                ):
+                    maybe_w = active_tile_header.get("tile_width")
+                    maybe_h = active_tile_header.get("tile_height")
+                    if isinstance(maybe_w, int) and maybe_w > 0:
+                        decode_width = maybe_w
+                    if isinstance(maybe_h, int) and maybe_h > 0:
+                        decode_height = maybe_h
+                payloads.append((*parsed, decode_width, decode_height))
 
     return _derive_extent_pixel_size(vdc_extent), payloads
 
@@ -217,13 +243,22 @@ def _render_element29_overlays(
     tile_h = max(1, total_h // max(1, rows))
     overlays: list[tuple[str, float, float, float, float]] = []
 
-    for tile_index, (compression, row_padding, bit_order, orientation, payload) in enumerate(
-        payloads
-    ):
+    for tile_index, (
+        compression,
+        row_padding,
+        bit_order,
+        orientation,
+        payload,
+        decode_w_hint,
+        decode_h_hint,
+    ) in enumerate(payloads):
+        decode_w = decode_w_hint if isinstance(decode_w_hint, int) and decode_w_hint > 0 else tile_w
+        decode_h = decode_h_hint if isinstance(decode_h_hint, int) and decode_h_hint > 0 else tile_h
+
         tile_image = _decode_element29_payload_with_fallbacks(
             payload,
-            width=tile_w,
-            height=tile_h,
+            width=decode_w,
+            height=decode_h,
             compression=compression,
             row_padding=row_padding,
             bit_order=bit_order,
@@ -253,11 +288,21 @@ def _render_first_element29_raster(
         return None
 
     width, height = size_hint
-    for compression, row_padding, bit_order, orientation, payload in payloads:
+    for (
+        compression,
+        row_padding,
+        bit_order,
+        orientation,
+        payload,
+        decode_w_hint,
+        decode_h_hint,
+    ) in payloads:
+        decode_w = decode_w_hint if isinstance(decode_w_hint, int) and decode_w_hint > 0 else width
+        decode_h = decode_h_hint if isinstance(decode_h_hint, int) and decode_h_hint > 0 else height
         image = _decode_element29_payload_with_fallbacks(
             payload,
-            width=width,
-            height=height,
+            width=decode_w,
+            height=decode_h,
             compression=compression,
             row_padding=row_padding,
             bit_order=bit_order,
