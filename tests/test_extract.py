@@ -45,6 +45,13 @@ def _apd_property(key: bytes, value: bytes) -> bytes:
     return bytes([len(key)]) + key + bytes([len(value)]) + value
 
 
+def _long_form_element(class_id: int, element_id: int, parameters: bytes) -> bytes:
+    header = _header(class_id, element_id, 0x1F)
+    chunk_header = len(parameters).to_bytes(2, "big")
+    padding = b"\x00" if len(parameters) % 2 else b""
+    return header + chunk_header + parameters + padding
+
+
 def test_extract_raw_images_from_bytes_reads_cell_array_payload() -> None:
     params = (
         (b"\x00" * 12)
@@ -640,6 +647,8 @@ def test_gr_78946_renders_binary_text_and_arcs() -> None:
 
     svg = extract_vector_svg_from_bytes(source.read_bytes())
 
+    assert svg.count("<image ") >= 2
+    assert 'preserveAspectRatio="none"' in svg
     assert "<text " in svg
     assert "<polyline" in svg or "<polygon" in svg
     assert "unsupported drawing primitives" not in svg
@@ -669,6 +678,73 @@ def test_gr_78946_does_not_emit_noisy_massive_polylines() -> None:
         assert max(point_cloud_sizes) < 200
     else:
         assert "<polygon" in svg
+
+
+def test_gr_78946_binary_id28_tile_array_metadata_is_deterministic() -> None:
+    from pathlib import Path  # noqa: PLC0415
+
+    from cgm.extract.tiles import _parse_tile_arrays  # noqa: PLC0415
+
+    root = Path(__file__).resolve().parents[1]
+    candidates = [
+        root / "sample" / "GR-78946.cgm",
+        root / "test_files" / "GR-78946.cgm",
+    ]
+    source = next((path for path in candidates if path.exists()), candidates[0])
+
+    arrays = _parse_tile_arrays(source.read_bytes())
+
+    assert arrays
+    array = arrays[0]
+    assert array["cols"] == 3
+    assert array["rows"] == 4
+    assert array["tile_width"] == 709
+    assert array["tile_height"] == 776
+    assert array["total_width"] == 2125
+    assert array["total_height"] == 3104
+    tiles = array["tiles"]
+    assert isinstance(tiles, list)
+    assert len(tiles) == 12
+    first_tile = tiles[0]
+    assert isinstance(first_tile, dict)
+    assert first_tile["compression"] == 2
+    assert first_tile["row_padding"] == 16
+    assert first_tile["bit_order"] == 1
+    assert first_tile["orientation"] == 0
+
+
+def test_binary_id28_raster_uses_vdc_extent_for_viewbox() -> None:
+    vdc_extent = b"\x00\x00\x00\x00\x00\x08\x00\x02"
+    vdc_element = _header(2, 6, len(vdc_extent)) + vdc_extent
+
+    # Small vector primitive inside the page extent; this used to collapse the
+    # SVG bounds to the vector subset and stretch the raster overlay.
+    line_points = b"\x00\x00\x00\x00\x00\x01\x00\x01"
+    line_element = _header(4, 1, len(line_points)) + line_points
+
+    tile_array_header = (
+        b"\x00\x00\x00\x00"
+        + (1).to_bytes(4, "big")
+        + (1).to_bytes(2, "big")
+        + (1).to_bytes(2, "big")
+        + (2).to_bytes(2, "big")
+        + (1).to_bytes(2, "big")
+        + (b"\x00" * 12)
+        + (8).to_bytes(2, "big")
+        + (2).to_bytes(2, "big")
+    )
+    begin_tile_array = _long_form_element(0, 19, tile_array_header)
+
+    id28_payload = b"\x00\x00\x00\x00\x00\x00\x80"
+    id28_element = _header(4, 28, len(id28_payload)) + id28_payload + b"\x00"
+    end_tile_array = _header(0, 20, 0)
+
+    svg = extract_vector_svg_from_bytes(
+        vdc_element + line_element + begin_tile_array + id28_element + end_tile_array
+    )
+
+    assert 'viewBox="0.000 0.000 8.000 2.000"' in svg
+    assert "<image " in svg
 
 
 def test_extract_raw_images_from_clear_text_bitonal_tiles() -> None:

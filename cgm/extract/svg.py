@@ -608,7 +608,13 @@ def extract_vector_svg_from_bytes(
         all_points.append((x, y))
         all_points.append((x + box_w, y + box_h))
 
-    if all_points:
+    if vdc_extent is not None and (
+        raster_tile_overlays is not None
+        or element29_overlays is not None
+        or raster_background is not None
+    ):
+        min_x, min_y, max_x, max_y = vdc_extent
+    elif all_points:
         bounds_points = _filter_points_for_bounds(all_points, vdc_extent=vdc_extent)
         min_x = min(point[0] for point in bounds_points)
         max_x = max(point[0] for point in bounds_points)

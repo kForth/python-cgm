@@ -15,6 +15,7 @@ from cgm.extract.core import (
     indexed_palette_bytes,
     scale_direct16_rgb_payload,
 )
+from cgm.parser import iter_elements
 
 _TEXT_NUMBER_RE = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
 _TEXT_HEX_RUN_RE = re.compile(r"[0-9A-Fa-f]{32,}")
@@ -269,8 +270,107 @@ def _finalize_tile_array_record(array: dict[str, object]) -> dict[str, object] |
 
 
 def _parse_tile_arrays(data: bytes) -> list[dict[str, object]]:
-    """Parse tile-array metadata from explicit text commands only."""
-    return _parse_text_tile_arrays(data)
+    """Parse tile-array metadata from text commands or binary id-28 blocks."""
+    text_arrays = _parse_text_tile_arrays(data)
+    if text_arrays:
+        return text_arrays
+    return _parse_binary_tile_arrays(data)
+
+
+def _parse_binary_tile_array_header(parameters: bytes) -> dict[str, int] | None:
+    """Parse the stable 32-byte binary tile-array header used in the corpus."""
+    if len(parameters) < 32:
+        return None
+
+    cell_path = int.from_bytes(parameters[4:8], "big", signed=False)
+    cols = int.from_bytes(parameters[8:10], "big", signed=False)
+    rows = int.from_bytes(parameters[10:12], "big", signed=False)
+    tile_width = int.from_bytes(parameters[12:14], "big", signed=False)
+    tile_height = int.from_bytes(parameters[14:16], "big", signed=False)
+    total_width = int.from_bytes(parameters[28:30], "big", signed=False)
+    total_height = int.from_bytes(parameters[30:32], "big", signed=False)
+
+    if min(cols, rows, tile_width, tile_height, total_width, total_height) <= 0:
+        return None
+
+    return {
+        "cell_path": cell_path,
+        "cols": cols,
+        "rows": rows,
+        "tile_width": tile_width,
+        "tile_height": tile_height,
+        "total_width": total_width,
+        "total_height": total_height,
+    }
+
+
+def _parse_binary_id28_tile(parameters: bytes) -> dict[str, object] | None:
+    """Parse the corpus-stable class-4/id-28 tile wrapper."""
+    if len(parameters) <= 7:
+        return None
+
+    payload = parameters[7:]
+    if not payload:
+        return None
+
+    return {
+        "payload": payload,
+        "compression": int.from_bytes(parameters[0:2], "big", signed=False),
+        "row_padding": int.from_bytes(parameters[2:4], "big", signed=False),
+        "bit_order": int.from_bytes(parameters[4:6], "big", signed=False),
+        "orientation": int(parameters[6]),
+    }
+
+
+def _parse_binary_tile_arrays(data: bytes) -> list[dict[str, object]]:
+    """Parse binary tile arrays wrapped around class-4/id-28 payloads."""
+    arrays: list[dict[str, object]] = []
+    current: dict[str, object] | None = None
+
+    for element in iter_elements(data):
+        if element.class_id == 0 and element.element_id == 19:
+            header = _parse_binary_tile_array_header(element.parameters)
+            if header is None:
+                current = None
+                continue
+            current = _make_tile_array_record(
+                cols=header["cols"],
+                rows=header["rows"],
+                tile_width=header["tile_width"],
+                tile_height=header["tile_height"],
+                total_width=header["total_width"],
+                total_height=header["total_height"],
+                cell_path=header["cell_path"],
+            )
+            continue
+
+        if element.class_id == 4 and element.element_id == 28 and current is not None:
+            tile = _parse_binary_id28_tile(element.parameters)
+            if tile is None:
+                continue
+            _append_tile_record(
+                current,
+                payload=tile["payload"] if isinstance(tile["payload"], bytes) else b"",
+                compression=tile["compression"] if isinstance(tile["compression"], int) else None,
+                bit_order=tile["bit_order"] if isinstance(tile["bit_order"], int) else None,
+                orientation=tile["orientation"] if isinstance(tile["orientation"], int) else None,
+                family=None,
+                row_padding=tile["row_padding"] if isinstance(tile["row_padding"], int) else None,
+            )
+            continue
+
+        if element.class_id == 0 and element.element_id == 20 and current is not None:
+            finalized = _finalize_tile_array_record(current)
+            if finalized is not None:
+                arrays.append(finalized)
+            current = None
+
+    if current is not None:
+        finalized = _finalize_tile_array_record(current)
+        if finalized is not None:
+            arrays.append(finalized)
+
+    return arrays
 
 
 def _parse_text_tile_arrays(data: bytes) -> list[dict[str, object]]:
