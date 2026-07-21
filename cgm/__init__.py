@@ -1,9 +1,9 @@
-"""Python tools for CGM parsing, tile/raster decoding, SVG composition, and hotspot extraction."""
+"""Python tools for CGM parsing, raster decoding, SVG composition, and hotspot extraction."""
 
 __author__ = "Kestin Goforth"
 __copyright__ = "Copyright 2026"
 __license__ = "BSD-3-Clause"
-__version__ = "0.3.0"
+__version__ = "0.3.3"
 
 import logging
 

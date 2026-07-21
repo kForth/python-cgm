@@ -18,7 +18,7 @@ from PIL import Image
 from cgm.parser import iter_elements
 
 if TYPE_CHECKING:
-    from cgm.types import RawImage
+    from cgm.types import CGMElement, RawImage
 
 log = logging.getLogger("cgm.extract")
 
@@ -145,11 +145,16 @@ class _CgmDescriptorProfile:
     vdc_real_precision_bits: int | None = None
 
 
-def extract_descriptor_profile(data: bytes) -> _CgmDescriptorProfile:
+def extract_descriptor_profile(
+    data: bytes,
+    *,
+    elements: list[CGMElement] | None = None,
+) -> _CgmDescriptorProfile:
     """Extract a minimal CGM descriptor profile used for strict coordinate decode."""
 
     profile = _CgmDescriptorProfile()
-    for element in iter_elements(data):
+    source_elements = iter_elements(data) if elements is None else elements
+    for element in source_elements:
         if element.class_id != 1:
             continue
 

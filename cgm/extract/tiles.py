@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 
 import imagecodecs
 from PIL import Image
@@ -36,6 +37,22 @@ def _reverse_bits_in_byte(value: int) -> int:
     value = ((value & 0xCC) >> 2) | ((value & 0x33) << 2)
     value = ((value & 0xAA) >> 1) | ((value & 0x55) << 1)
     return value
+
+
+@lru_cache(maxsize=512)
+def _cached_ccittfax3_decode(payload: bytes, *, height: int, width: int) -> bytes | None:
+    try:
+        return bytes(imagecodecs.ccittfax3_decode(payload, height=height, width=width))
+    except (RuntimeError, ValueError):
+        return None
+
+
+@lru_cache(maxsize=512)
+def _cached_ccittfax4_decode(payload: bytes, *, height: int, width: int) -> bytes | None:
+    try:
+        return bytes(imagecodecs.ccittfax4_decode(payload, height=height, width=width))
+    except (RuntimeError, ValueError):
+        return None
 
 
 def _decode_fax_output_to_bitmap(output: bytes, width: int, height: int) -> list[int] | None:
@@ -546,9 +563,8 @@ def _decode_bitonal_payload_with_details(
         }
 
     if compression == 1:
-        try:
-            decoded = bytes(imagecodecs.ccittfax3_decode(payload, height=height, width=width))
-        except (RuntimeError, ValueError):
+        decoded = _cached_ccittfax3_decode(payload, height=height, width=width)
+        if decoded is None:
             return None, {
                 "best_score": None,
                 "candidate_count": 0,
@@ -616,9 +632,8 @@ def _decode_bitonal_payload_with_details(
 
         def _fax4_try(w_val: int) -> tuple[Image.Image | None, int, int]:
             inf = height + 1
-            try:
-                raw = bytes(imagecodecs.ccittfax4_decode(payload, height=height, width=w_val))
-            except (RuntimeError, ValueError):
+            raw = _cached_ccittfax4_decode(payload, height=height, width=w_val)
+            if raw is None:
                 return None, inf, inf
             if w_val > width:
                 stripped = bytearray()

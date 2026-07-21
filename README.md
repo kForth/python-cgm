@@ -33,6 +33,7 @@ pip install python-cgm
 - Parses binary and clear-text CGM command streams.
 - Finds `Cell Array` elements (class 4, element 9) and extracts their raw payload bytes.
 - Decodes clear-text tiled bitonal, indexed, and direct-color arrays.
+- Decodes prefixed class 4, id 29 raster payloads with conservative fallback candidates.
 - Builds a final SVG output that can include an embedded raster background.
 - Converts vector-like CGM drawing primitives into SVG overlays.
 - Extracts hotspots from APD `name`/`region` records and APS geometry groups.
@@ -158,7 +159,7 @@ and clear-text CGM workflows.
 - `class 4, ids 13-16, 18-25, 27` (arc families): rendered as best-effort polyline geometry.
 - `class 4, id 17` (`Ellipse`): rendered as SVG ellipse.
 - `class 4, id 28`: parsed but no strict vector fallback rendering.
-- `class 4, id 29` (`Restricted Text`): rendered when text payload decodes.
+- `class 4, id 29` (`Restricted Text` or prefixed raster payload): restricted text is rendered when text payload decodes; non-text prefixed payloads are evaluated as raster candidates.
 - `class 5, id 3` (`Line Width`): applied to SVG stroke width.
 - `class 5, id 4` (`Line Color`): applied via palette/index mapping.
 - `class 5, id 15` (`Character Height`): applied to SVG text size.
@@ -185,6 +186,7 @@ and clear-text CGM workflows.
 - Decodes bitonal raster data for uncompressed, CCITT Group 3, and CCITT Group 4 paths.
 - Decodes indexed-color and direct-color tile payloads when dimensions/precision are usable.
 - Composes raster backgrounds into SVG (embedded PNG data URI) before vector overlays.
+- For multi-payload class 4, id 29 rasters, emits separate SVG `<image>` tile overlays when a simple inferred tile grid decodes successfully.
 
 ### Hotspot Features
 

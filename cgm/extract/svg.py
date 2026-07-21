@@ -37,6 +37,7 @@ from cgm.extract.core import (
 )
 from cgm.extract.tiles import (
     _decode_tile_payload_to_image,
+    _infer_tile_grid,
     _parse_tile_arrays,
     _render_first_tile_array,
 )
@@ -95,6 +96,225 @@ def _image_to_png_data_uri(image: Any | None) -> str | None:
     image.save(buffer, "PNG")
     payload = base64.b64encode(buffer.getvalue()).decode("ascii")
     return f"data:image/png;base64,{payload}"
+
+
+def _derive_extent_pixel_size(
+    vdc_extent: tuple[float, float, float, float] | None,
+) -> tuple[int, int] | None:
+    if vdc_extent is None:
+        return None
+
+    min_x, min_y, max_x, max_y = vdc_extent
+    width = round(abs(max_x - min_x))
+    height = round(abs(max_y - min_y))
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def _parse_element29_raster_prefix(
+    parameters: bytes,
+) -> tuple[int, int, int, int, bytes] | None:
+    """Parse observed class-4/id-29 raster prefix layout.
+
+    Layout: ``u16 compression``, ``u16 row_padding``, ``u16 bit_order``,
+    ``u8 orientation``, then encoded raster payload bytes.
+    """
+    if len(parameters) <= 7:
+        return None
+
+    compression = int.from_bytes(parameters[0:2], "big", signed=False)
+    row_padding = int.from_bytes(parameters[2:4], "big", signed=False)
+    bit_order = int.from_bytes(parameters[4:6], "big", signed=False)
+    orientation = parameters[6]
+    payload = parameters[7:]
+    if compression not in (0, 1, 2) or not payload:
+        return None
+    return compression, row_padding, bit_order, orientation, payload
+
+
+def _element29_signal_metrics(image: Any) -> tuple[float, int, int]:
+    grayscale = image.convert("L")
+    histogram = grayscale.histogram()
+    if not histogram:
+        return 0.0, 0, 0
+
+    total = grayscale.width * grayscale.height
+    if total <= 0:
+        return 0.0, 0, 0
+
+    nonwhite = total - histogram[255]
+    if nonwhite <= 0 or nonwhite >= total:
+        return 0.0, 0, 0
+
+    active_rows = 0
+    pixels = grayscale.load()
+    for y in range(grayscale.height):
+        has_signal = False
+        for x in range(grayscale.width):
+            if pixels[x, y] < 250:
+                has_signal = True
+                break
+        if has_signal:
+            active_rows += 1
+
+    return nonwhite / total, active_rows, nonwhite
+
+
+def _decode_element29_payload_with_fallbacks(
+    payload: bytes,
+    *,
+    width: int,
+    height: int,
+    compression: int,
+    row_padding: int,
+    bit_order: int,
+    orientation: int,
+) -> Any | None:
+    """Decode one id-29 payload with conservative fallback candidates.
+
+    The declared prefix candidate is tried first. For fax4-prefixed payloads
+    that decode to all-white output, a limited fax3 fallback is evaluated and
+    accepted only when minimal signal thresholds are met.
+    """
+    candidates: list[tuple[int, int]] = []
+
+    def _add(compression_value: int, bit_order_value: int) -> None:
+        if (compression_value, bit_order_value) not in candidates:
+            candidates.append((compression_value, bit_order_value))
+
+    _add(compression, bit_order)
+    if bit_order in (0, 1):
+        _add(compression, 1 - bit_order)
+
+    # Corpus-derived fallback: some id-29 payloads labeled as fax4 decode as
+    # all-white under ccittfax4 but still carry usable signal under fax3.
+    if compression == 2:
+        _add(1, 0)
+        _add(1, 1)
+
+    best_image: Any | None = None
+    best_score: tuple[float, int, int] | None = None
+
+    for compression_value, bit_order_value in candidates:
+        image = _decode_tile_payload_to_image(
+            payload,
+            width,
+            height,
+            compression=compression_value,
+            bit_order=bit_order_value,
+            row_padding=row_padding,
+            orientation=orientation,
+        )
+        if image is None:
+            continue
+
+        ratio, active_rows, nonwhite = _element29_signal_metrics(image)
+        if ratio <= 0.0:
+            continue
+
+        # Keep fallback conservative to avoid rendering tiny decode artifacts.
+        if compression_value != compression and (ratio < 0.0005 or active_rows < 8):
+            continue
+
+        score = (ratio, active_rows, nonwhite)
+        if best_score is None or score > best_score:
+            best_score = score
+            best_image = image
+
+        # Prefer the declared candidate when it already carries valid signal.
+        if compression_value == compression and bit_order_value == bit_order:
+            return image
+
+    return best_image
+
+
+def _collect_element29_raster_payloads(
+    data: bytes,
+) -> tuple[tuple[int, int] | None, list[tuple[int, int, int, int, bytes]]]:
+    vdc_extent: tuple[float, float, float, float] | None = None
+    payloads: list[tuple[int, int, int, int, bytes]] = []
+
+    for element in iter_elements(data):
+        if element.class_id == 2 and element.element_id == 6:
+            decoded_extent = decode_vdc_extent(element.parameters)
+            if decoded_extent is not None:
+                vdc_extent = decoded_extent
+            continue
+
+        if element.class_id == 4 and element.element_id == 29:
+            if decode_restricted_text(element.parameters) is not None:
+                continue
+            parsed = _parse_element29_raster_prefix(element.parameters)
+            if parsed is not None:
+                payloads.append(parsed)
+
+    return _derive_extent_pixel_size(vdc_extent), payloads
+
+
+def _render_element29_overlays(
+    data: bytes,
+) -> tuple[list[tuple[str, float, float, float, float]], int, int] | None:
+    size_hint, payloads = _collect_element29_raster_payloads(data)
+    if size_hint is None or len(payloads) < 2:
+        return None
+
+    total_w, total_h = size_hint
+    cols, rows = _infer_tile_grid(len(payloads), total_w, total_h)
+    tile_w = max(1, total_w // max(1, cols))
+    tile_h = max(1, total_h // max(1, rows))
+    overlays: list[tuple[str, float, float, float, float]] = []
+
+    for tile_index, (compression, row_padding, bit_order, orientation, payload) in enumerate(
+        payloads
+    ):
+        tile_image = _decode_element29_payload_with_fallbacks(
+            payload,
+            width=tile_w,
+            height=tile_h,
+            compression=compression,
+            row_padding=row_padding,
+            bit_order=bit_order,
+            orientation=orientation,
+        )
+        if tile_image is None:
+            return None
+
+        href = _image_to_png_data_uri(tile_image)
+        if href is None:
+            return None
+
+        row = tile_index // cols
+        col = tile_index % cols
+        x = float(col * tile_w)
+        y = float(row * tile_h)
+        overlays.append((href, x, y, float(tile_w), float(tile_h)))
+
+    return overlays, total_w, total_h
+
+
+def _render_first_element29_raster(
+    data: bytes,
+) -> Any | None:
+    size_hint, payloads = _collect_element29_raster_payloads(data)
+    if size_hint is None:
+        return None
+
+    width, height = size_hint
+    for compression, row_padding, bit_order, orientation, payload in payloads:
+        image = _decode_element29_payload_with_fallbacks(
+            payload,
+            width=width,
+            height=height,
+            compression=compression,
+            row_padding=row_padding,
+            bit_order=bit_order,
+            orientation=orientation,
+        )
+        if image is not None:
+            return image
+
+    return None
 
 
 def _render_first_tile_array_overlays(
@@ -193,6 +413,12 @@ def _render_raster_background_data_uri(
         if href is not None:
             return href, tiled.width, tiled.height
 
+    class29_raster = _render_first_element29_raster(data)
+    if class29_raster is not None:
+        href = _image_to_png_data_uri(class29_raster)
+        if href is not None:
+            return href, class29_raster.width, class29_raster.height
+
     indexed_palette = indexed_palette_bytes(extract_color_table(data))
     color_value_extent = extract_color_value_extent(data)
 
@@ -214,7 +440,11 @@ def _render_raster_background_data_uri(
 def extract_vector_svg_from_bytes(
     data: bytes,
 ) -> str:
-    """Convert supported CGM vector primitives and raster tile backgrounds into SVG."""
+    """Convert CGM vector primitives and raster candidates into SVG.
+
+    Raster precedence is: explicit tile-array overlays, id-29 multi-tile
+    overlays, id-29 single-raster background, then Cell Array raster fallback.
+    """
     style = _SvgStyle()
     color_table = extract_color_table(data)
     text_items: list[tuple[float, float, str, str, float]] = []
@@ -226,12 +456,16 @@ def extract_vector_svg_from_bytes(
     circle_items: list[tuple[float, float, float, str, float]] = []
     ellipse_items: list[tuple[float, float, float, float, str, float]] = []
     gdp_parameters: list[bytes] = []
-    element29_payloads: list[bytes] = []
     vdc_extent: tuple[float, float, float, float] | None = None
     descriptor_profile = extract_descriptor_profile(data)
     raster_tile_overlays = _render_first_tile_array_overlays(data)
+    element29_overlays = (
+        None if raster_tile_overlays is not None else _render_element29_overlays(data)
+    )
     raster_background = (
-        None if raster_tile_overlays is not None else _render_raster_background_data_uri(data)
+        None
+        if raster_tile_overlays is not None or element29_overlays is not None
+        else _render_raster_background_data_uri(data)
     )
     transparency_enabled = True
     clip_enabled = False
@@ -391,8 +625,6 @@ def extract_vector_svg_from_bytes(
                 restricted_text_items.append(
                     (anchor_x, anchor_y, box_w, box_h, text, style.stroke_color, style.font_size)
                 )
-            else:
-                element29_payloads.append(element.parameters)
 
     for parameters in gdp_parameters:
         points = decode_gdp_polyline_points(
@@ -434,6 +666,9 @@ def extract_vector_svg_from_bytes(
         min_x, min_y, max_x, max_y = vdc_extent
     elif raster_tile_overlays is not None:
         _tile_entries, raster_w, raster_h = raster_tile_overlays
+        min_x, min_y, max_x, max_y = 0.0, 0.0, float(raster_w), float(raster_h)
+    elif element29_overlays is not None:
+        _tile_entries, raster_w, raster_h = element29_overlays
         min_x, min_y, max_x, max_y = 0.0, 0.0, float(raster_w), float(raster_h)
     elif raster_background is not None:
         _href, raster_w, raster_h = raster_background
@@ -487,6 +722,22 @@ def extract_vector_svg_from_bytes(
 
     if raster_tile_overlays is not None:
         tile_entries, tile_total_w, tile_total_h = raster_tile_overlays
+        scale_x = width / max(1.0, float(tile_total_w))
+        scale_y = height / max(1.0, float(tile_total_h))
+        for href, tile_x, tile_y, tile_w, tile_h in tile_entries:
+            mapped_x = min_x + (tile_x * scale_x)
+            mapped_y = min_y + (tile_y * scale_y)
+            mapped_w = max(0.0, tile_w * scale_x)
+            mapped_h = max(0.0, tile_h * scale_y)
+            if mapped_w <= 0.0 or mapped_h <= 0.0:
+                continue
+            svg_lines.append(
+                f'  <image x="{mapped_x:.3f}" y="{mapped_y:.3f}" '
+                f'width="{mapped_w:.3f}" height="{mapped_h:.3f}" preserveAspectRatio="none" '
+                f'image-rendering="pixelated" href="{href}"{clip_attr} />'
+            )
+    elif element29_overlays is not None:
+        tile_entries, tile_total_w, tile_total_h = element29_overlays
         scale_x = width / max(1.0, float(tile_total_w))
         scale_y = height / max(1.0, float(tile_total_h))
         for href, tile_x, tile_y, tile_w, tile_h in tile_entries:
@@ -582,20 +833,6 @@ def extract_vector_svg_from_bytes(
             f'font-family="sans-serif" textLength="{box_width:.3f}" '
             f'lengthAdjust="spacingAndGlyphs"{clip_attr}>{escaped}</text>'
         )
-
-    if (
-        not polyline_items
-        and not polygon_items
-        and not marker_items
-        and not rectangle_items
-        and not circle_items
-        and not ellipse_items
-        and not text_items
-        and not restricted_text_items
-        and raster_background is None
-        and element29_payloads
-    ):
-        pass
 
     svg_lines.append("</svg>")
     return "\n".join(svg_lines) + "\n"

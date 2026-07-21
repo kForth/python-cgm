@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from cgm.extract.core import (
     coerce_int,
@@ -23,18 +24,26 @@ from cgm.extract.tiles import (
 from cgm.parser import CELL_ARRAY_CLASS_ID, CELL_ARRAY_ELEMENT_ID, iter_elements
 from cgm.types import RawImage
 
+if TYPE_CHECKING:
+    from cgm.types import CGMElement
+
 log = logging.getLogger("cgm.extract")
 
 
-def extract_raw_images_from_bytes(data: bytes) -> list[RawImage]:
+def extract_raw_images_from_bytes(
+    data: bytes,
+    *,
+    elements: list[CGMElement] | None = None,
+) -> list[RawImage]:
     """Extract raw raster payloads from Cell Array elements in a CGM stream."""
     images: list[RawImage] = []
     image_index = 0
+    parsed_elements = list(iter_elements(data)) if elements is None else elements
 
     if log.isEnabledFor(logging.DEBUG):
         log.debug("Starting extraction from %d bytes", len(data))
 
-    for element in iter_elements(data):
+    for element in parsed_elements:
         if element.class_id != CELL_ARRAY_CLASS_ID or element.element_id != CELL_ARRAY_ELEMENT_ID:
             continue
 

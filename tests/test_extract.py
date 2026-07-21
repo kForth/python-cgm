@@ -84,7 +84,7 @@ def test_render_raw_image_payload_prefers_indexed_when_precision_is_8bit() -> No
         cell_representation_mode=0,
     )
 
-    image = extract_module.render_raw_image_payload(raw)
+    image = extract_module._render_raw_image_payload(raw)
 
     assert image is not None
     assert image.mode == "P"
@@ -274,7 +274,7 @@ def test_extract_color_table_handles_16bit_components() -> None:
     color_table = bytes([0, 2]) + bytes.fromhex("ffff00008000")
     data += _header(5, 34, len(color_table)) + color_table
 
-    table = extract_module.extract_color_table(bytes(data))
+    table = extract_module._extract_color_table(bytes(data))
 
     assert table.get(2) == (255, 0, 128)
 
@@ -283,8 +283,8 @@ def test_extract_color_value_extent_from_binary_and_clear_text() -> None:
     binary = _header(1, 10, 12) + b"\x00\x00\x00\x00\x00\x00\x0f\xff\x0f\xff\x0f\xff"
     clear_text = b"COLRVALUEEXT 0 0 0 4095 4095 4095;"
 
-    binary_extent = extract_module.extract_color_value_extent(binary)
-    clear_text_extent = extract_module.extract_color_value_extent(clear_text)
+    binary_extent = extract_module._extract_color_value_extent(binary)
+    clear_text_extent = extract_module._extract_color_value_extent(clear_text)
 
     assert binary_extent == (0, 0, 0, 4095, 4095, 4095)
     assert clear_text_extent == (0, 0, 0, 4095, 4095, 4095)
@@ -532,9 +532,40 @@ def test_gr_283383_default_svg_does_not_use_heuristic_class29_fallback() -> None
 
     svg = extract_vector_svg_from_bytes(source.read_bytes())
 
-    assert "<image " not in svg
+    assert "<image " in svg
     assert "unsupported drawing primitives" not in svg
     assert "POSID_" not in svg
+
+
+def test_gr_77775_svg_emits_multiple_class29_tile_images() -> None:
+    from pathlib import Path  # noqa: PLC0415
+
+    root = Path(__file__).resolve().parents[1]
+    candidates = [
+        root / "sample" / "GR-77775.cgm",
+        root / "test_files" / "GR-77775.cgm",
+    ]
+    source = next((path for path in candidates if path.exists()), candidates[0])
+
+    svg = extract_vector_svg_from_bytes(source.read_bytes())
+
+    assert svg.count("<image ") >= 2
+    assert 'preserveAspectRatio="none"' in svg
+
+
+def test_gr_217420_id29_fallback_renders_image() -> None:
+    from pathlib import Path  # noqa: PLC0415
+
+    root = Path(__file__).resolve().parents[1]
+    candidates = [
+        root / "sample" / "GR-217420.cgm",
+        root / "test_files" / "GR-217420.cgm",
+    ]
+    source = next((path for path in candidates if path.exists()), candidates[0])
+
+    svg = extract_vector_svg_from_bytes(source.read_bytes())
+
+    assert "<image " in svg
 
 
 def test_gr_78946_renders_binary_text_and_arcs() -> None:
@@ -746,7 +777,7 @@ def test_render_raw_image_payload_uses_supplied_palette_colors() -> None:
     palette = bytearray(value for value in range(256) for _ in range(3))
     palette[3:6] = bytes([255, 0, 0])
 
-    image = extract_module.render_raw_image_payload(raw, indexed_palette=bytes(palette))
+    image = extract_module._render_raw_image_payload(raw, indexed_palette=bytes(palette))
 
     assert image is not None
     rgb = image.convert("RGB")
@@ -757,7 +788,7 @@ def test_render_raw_image_payload_uses_supplied_palette_colors() -> None:
 def test_render_first_tile_array_uses_color_table_palette() -> None:
     tile_payload = bytes([0, 1, 0, 1])
     color_table = {1: (255, 0, 0)}
-    palette = extract_module.indexed_palette_bytes(color_table)
+    palette = extract_module._indexed_palette_bytes(color_table)
 
     image = extract_module._decode_tile_payload_to_image(
         tile_payload,
@@ -800,7 +831,7 @@ def test_render_raw_image_payload_scales_16bit_direct_color_extent() -> None:
         cell_representation_mode=0,
     )
 
-    image = extract_module.render_raw_image_payload(
+    image = extract_module._render_raw_image_payload(
         raw,
         color_value_extent=(0, 0, 0, 4095, 4095, 4095),
     )
@@ -842,7 +873,7 @@ def test_render_raw_image_payload_scales_nonzero_16bit_extent_and_clamps() -> No
         cell_representation_mode=0,
     )
 
-    image = extract_module.render_raw_image_payload(
+    image = extract_module._render_raw_image_payload(
         raw,
         color_value_extent=(1024, 1024, 1024, 3072, 3072, 3072),
     )

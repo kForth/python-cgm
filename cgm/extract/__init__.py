@@ -36,11 +36,20 @@ from cgm.extract.svg import (
 )
 from cgm.types import HotSpot, RawImage
 
+_extract_color_table = extract_color_table
+_extract_color_value_extent = extract_color_value_extent
+_indexed_palette_bytes = indexed_palette_bytes
+_render_raw_image_payload = render_raw_image_payload
+
 __all__ = [
     "HotSpot",
     "RawImage",
     "_decode_tile_payload_to_image",
+    "_extract_color_table",
+    "_extract_color_value_extent",
+    "_indexed_palette_bytes",
     "_parse_text_tile_arrays",
+    "_render_raw_image_payload",
     "extract_color_table",
     "extract_color_value_extent",
     "extract_data_json",
