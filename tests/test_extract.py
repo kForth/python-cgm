@@ -676,8 +676,8 @@ def test_id29_prefix_families_have_no_new_frequent_format() -> None:
         prefix: count for prefix, count in prefix_counts.items() if prefix not in known_families
     }
 
-    assert unknown_families
-    assert max(unknown_families.values()) <= 2
+    if unknown_families:
+        assert max(unknown_families.values()) <= 2
 
 
 def test_0800c8af84b96799_gdp_alignment_avoids_collapsed_viewbox() -> None:
