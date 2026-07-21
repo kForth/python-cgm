@@ -11,6 +11,7 @@ import io
 import json
 import re
 import struct
+from collections import Counter
 from typing import TYPE_CHECKING
 
 import cgm.extract as extract_module
@@ -23,6 +24,9 @@ from cgm.extract import (
     extract_rendered_images_to_directory,
     extract_vector_svg_from_bytes,
 )
+from cgm.extract.core import decode_restricted_text
+from cgm.extract.svg import _parse_element29_raster_prefix
+from cgm.parser import iter_elements
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -566,6 +570,62 @@ def test_gr_217420_id29_fallback_renders_image() -> None:
     svg = extract_vector_svg_from_bytes(source.read_bytes())
 
     assert "<image " in svg
+
+
+def test_gr_351121_id29_safe_raw_profile_renders_image() -> None:
+    from pathlib import Path  # noqa: PLC0415
+
+    root = Path(__file__).resolve().parents[1]
+    candidates = [
+        root / "sample" / "GR-351121.cgm",
+        root / "test_files" / "GR-351121.cgm",
+    ]
+    source = next((path for path in candidates if path.exists()), candidates[0])
+
+    svg = extract_vector_svg_from_bytes(source.read_bytes())
+
+    assert "<image " in svg
+
+
+def test_id29_prefix_families_have_no_new_frequent_format() -> None:
+    from pathlib import Path  # noqa: PLC0415
+
+    root = Path(__file__).resolve().parents[1] / "test_files"
+    prefix_counts: Counter[tuple[int, int, int, int]] = Counter()
+
+    for source in root.glob("*.cgm"):
+        for element in iter_elements(source.read_bytes()):
+            if element.class_id != 4 or element.element_id != 29:
+                continue
+            if decode_restricted_text(element.parameters) is not None:
+                continue
+            parsed = _parse_element29_raster_prefix(element.parameters)
+            if parsed is None:
+                continue
+            prefix_counts[parsed[:4]] += 1
+
+    known_families = {
+        (2, 0, 1, 0),
+        (6, 0, 8, 6),
+        (7, 0, 8, 6),
+    }
+    unknown_families = {
+        prefix: count for prefix, count in prefix_counts.items() if prefix not in known_families
+    }
+
+    assert unknown_families
+    assert max(unknown_families.values()) <= 2
+
+
+def test_0800c8af84b96799_gdp_alignment_avoids_collapsed_viewbox() -> None:
+    from pathlib import Path  # noqa: PLC0415
+
+    root = Path(__file__).resolve().parents[1]
+    source = root / "test_files" / "0800c8af84b96799.cgm"
+
+    svg = extract_vector_svg_from_bytes(source.read_bytes())
+
+    assert 'viewBox="-0.245 -0.000 1.000 1.000"' not in svg
 
 
 def test_gr_78946_renders_binary_text_and_arcs() -> None:

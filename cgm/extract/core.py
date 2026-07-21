@@ -628,8 +628,18 @@ def decode_gdp_polyline_points(
     *,
     profile: _CgmDescriptorProfile,
 ) -> list[tuple[float, float]]:
-    """Decode GDP payload coordinates using declared VDC descriptors only."""
-    return decode_point_pairs_from_profile(parameters, profile=profile)
+    """Decode GDP payload coordinates using declared VDC descriptors only.
+
+    Some corpus files encode class-4/id-26 GDP payloads with a 2-byte GDP
+    identifier prefix before coordinate bytes. Strip that prefix when the
+    payload size indicates a 2-byte header plus aligned coordinate data.
+    """
+    payload = parameters
+    pair_size = 8 if profile.vdc_type == 1 else 4
+    if pair_size > 0 and (len(payload) % pair_size) == 2 and len(payload) > 2:
+        payload = payload[2:]
+
+    return decode_point_pairs_from_profile(payload, profile=profile)
 
 
 def decode_rectangle_corners(

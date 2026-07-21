@@ -49,6 +49,9 @@ _ID29_RASTER_MODELS: dict[tuple[int, int, int, int], tuple[tuple[int, int], ...]
     # prefix (compression, row_padding, bit_order, orientation)
     # ordered decode attempts (compression, bit_order)
     (2, 0, 1, 0): ((2, 1), (2, 0), (1, 0), (1, 1)),
+    # Prefix family that is predominantly raw bitonal in test_files.
+    # Keep this strict to avoid blank fax fallbacks on malformed payloads.
+    (6, 0, 8, 6): ((0, 0), (0, 1)),
     # Learned from remaining misses in the expanded test_files corpus.
     (7, 0, 8, 6): ((1, 0), (1, 1), (2, 1), (2, 0), (0, 0), (0, 1)),
 }
