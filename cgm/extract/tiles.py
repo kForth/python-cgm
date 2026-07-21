@@ -716,8 +716,13 @@ def _decode_bitonal_payload_with_details(
         preferred_width = width
         try_widths: list[int] = [width]
         if isinstance(row_padding, int) and row_padding > 8:
-            preferred_width = width + row_padding // 2
-            try_widths = [preferred_width, width, width + row_padding]
+            half_padding_width = width + row_padding // 2
+            if width % row_padding == 0:
+                preferred_width = width
+                try_widths = [width]
+            else:
+                preferred_width = half_padding_width
+                try_widths = [half_padding_width]
         elif isinstance(row_padding, int) and 0 < row_padding <= 8:
             preferred_width = width + row_padding
             try_widths = [preferred_width, width]

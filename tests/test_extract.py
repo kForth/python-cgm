@@ -650,6 +650,157 @@ def test_gr_77912_tiles_7_and_10_prefer_padded_fax4_width() -> None:
         assert ImageChops.difference(current, padded).getbbox() is None
 
 
+def test_gr_74218_and_gr_76072_tiles_prefer_nominal_fax4_width() -> None:
+    from pathlib import Path  # noqa: PLC0415
+
+    from PIL import Image, ImageChops  # noqa: PLC0415
+
+    from cgm.extract.tiles import (  # noqa: PLC0415
+        _cached_ccittfax4_decode,
+        _decode_fax_output_to_bitmap,
+        _decode_tile_payload_to_image,
+        _parse_tile_arrays,
+    )
+
+    root = Path(__file__).resolve().parents[1]
+    cases = (
+        ("GR-74218.cgm", 8),
+        ("GR-76072.cgm", 4),
+    )
+
+    for file_name, tile_index in cases:
+        candidates = [
+            root / "sample" / file_name,
+            root / "test_files" / file_name,
+        ]
+        source = next((path for path in candidates if path.exists()), candidates[0])
+        array = _parse_tile_arrays(source.read_bytes())[0]
+        tile_width_obj = array.get("tile_width")
+        tile_height_obj = array.get("tile_height")
+        tiles_obj = array.get("tiles")
+        assert isinstance(tile_width_obj, int)
+        assert isinstance(tile_height_obj, int)
+        assert isinstance(tiles_obj, list)
+        tile_width = tile_width_obj
+        tile_height = tile_height_obj
+
+        def _decode_explicit_width(
+            payload: bytes,
+            actual_width: int,
+            image_width: int,
+            image_height: int,
+        ) -> Image.Image:
+            raw = _cached_ccittfax4_decode(payload, height=image_height, width=actual_width)
+            assert raw is not None
+            if actual_width > image_width:
+                stripped = bytearray()
+                for row_idx in range(image_height):
+                    stripped.extend(
+                        raw[row_idx * actual_width : row_idx * actual_width + image_width]
+                    )
+                raw = bytes(stripped)
+            bits = _decode_fax_output_to_bitmap(raw, image_width, image_height)
+            assert bits is not None
+            pixels = bytes(0 if bit else 255 for bit in bits)
+            return Image.frombytes("L", (image_width, image_height), pixels)
+
+        tile = tiles_obj[tile_index]
+        assert isinstance(tile, dict)
+        payload = bytes(tile["payload"])
+        current = _decode_tile_payload_to_image(
+            payload,
+            tile_width,
+            tile_height,
+            compression=tile["compression"],
+            bit_order=tile["bit_order"],
+            row_padding=tile["row_padding"],
+            orientation=tile["orientation"],
+        )
+        nominal = _decode_explicit_width(payload, tile_width, tile_width, tile_height)
+        padded = _decode_explicit_width(payload, tile_width + 16, tile_width, tile_height)
+
+        assert current is not None
+        assert ImageChops.difference(nominal, padded).getbbox() is not None
+        assert ImageChops.difference(current, nominal).getbbox() is None
+
+
+def test_gr_78129_gr_78167_and_gr_78836_tiles_prefer_padded_fax4_width() -> None:
+    from pathlib import Path  # noqa: PLC0415
+
+    from PIL import Image, ImageChops  # noqa: PLC0415
+
+    from cgm.extract.tiles import (  # noqa: PLC0415
+        _cached_ccittfax4_decode,
+        _decode_fax_output_to_bitmap,
+        _decode_tile_payload_to_image,
+        _parse_tile_arrays,
+    )
+
+    root = Path(__file__).resolve().parents[1]
+    cases = (
+        ("GR-78129.cgm", 3),
+        ("GR-78129.cgm", 6),
+        ("GR-78167.cgm", 3),
+        ("GR-78167.cgm", 7),
+        ("GR-78836.cgm", 6),
+    )
+
+    for file_name, tile_index in cases:
+        candidates = [
+            root / "sample" / file_name,
+            root / "test_files" / file_name,
+        ]
+        source = next((path for path in candidates if path.exists()), candidates[0])
+        array = _parse_tile_arrays(source.read_bytes())[0]
+        tile_width_obj = array.get("tile_width")
+        tile_height_obj = array.get("tile_height")
+        tiles_obj = array.get("tiles")
+        assert isinstance(tile_width_obj, int)
+        assert isinstance(tile_height_obj, int)
+        assert isinstance(tiles_obj, list)
+        tile_width = tile_width_obj
+        tile_height = tile_height_obj
+
+        def _decode_explicit_width(
+            payload: bytes,
+            actual_width: int,
+            image_width: int,
+            image_height: int,
+        ) -> Image.Image:
+            raw = _cached_ccittfax4_decode(payload, height=image_height, width=actual_width)
+            assert raw is not None
+            if actual_width > image_width:
+                stripped = bytearray()
+                for row_idx in range(image_height):
+                    stripped.extend(
+                        raw[row_idx * actual_width : row_idx * actual_width + image_width]
+                    )
+                raw = bytes(stripped)
+            bits = _decode_fax_output_to_bitmap(raw, image_width, image_height)
+            assert bits is not None
+            pixels = bytes(0 if bit else 255 for bit in bits)
+            return Image.frombytes("L", (image_width, image_height), pixels)
+
+        tile = tiles_obj[tile_index]
+        assert isinstance(tile, dict)
+        payload = bytes(tile["payload"])
+        current = _decode_tile_payload_to_image(
+            payload,
+            tile_width,
+            tile_height,
+            compression=tile["compression"],
+            bit_order=tile["bit_order"],
+            row_padding=tile["row_padding"],
+            orientation=tile["orientation"],
+        )
+        nominal = _decode_explicit_width(payload, tile_width, tile_width, tile_height)
+        padded = _decode_explicit_width(payload, tile_width + 8, tile_width, tile_height)
+
+        assert current is not None
+        assert ImageChops.difference(nominal, padded).getbbox() is not None
+        assert ImageChops.difference(current, padded).getbbox() is None
+
+
 def test_id29_prefix_families_have_no_new_frequent_format() -> None:
     from pathlib import Path  # noqa: PLC0415
 
