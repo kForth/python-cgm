@@ -33,7 +33,7 @@ pip install python-cgm
 - Parses binary and clear-text CGM command streams.
 - Finds `Cell Array` elements (class 4, element 9) and extracts their raw payload bytes.
 - Decodes clear-text tiled bitonal, indexed, and direct-color arrays.
-- Decodes prefixed class 4, id 29 raster payloads using a fixed sample-derived decode model.
+- Decodes prefixed class-4/id-29 raster payloads using a fixed sample-derived decode model; when wrapped by binary tile-array metadata (class-0/id-19..20), decode dimensions can come from the wrapper tile header.
 - Builds a final SVG output that can include an embedded raster background.
 - Converts vector-like CGM drawing primitives into SVG overlays.
 - Extracts hotspots from APD `name`/`region` records and APS geometry groups.
@@ -136,36 +136,37 @@ and clear-text CGM workflows.
 
 ### Binary CGM Element Coverage
 
-- `class 1, id 3` (`VDC Type`): used to choose coordinate decoding path.
-- `class 1, id 10` (`Color Value Extent`): used for 16-bit direct-color scaling.
-- `class 1, id 11` (`VDC Integer Precision`): used for strict integer VDC decode.
-- `class 1, id 12` (`VDC Real Precision`): used for strict real VDC decode.
-- `class 2, id 6` (`VDC Extent`): used to set SVG view extents and raster placement.
-- `class 3, id 4` (`Transparency`): mapped to SVG background behavior.
-- `class 3, id 5` (`Clip Rectangle`): mapped to SVG clip paths.
-- `class 3, id 6` (`Clip Indicator`): enables/disables clipping.
-- `class 4, id 1` (`Polyline`): rendered to SVG polylines.
-- `class 4, id 2` (`Disjoint Polyline`): rendered as segment polylines.
-- `class 4, id 3` (`Polymarker`): rendered as SVG marker circles.
-- `class 4, id 4` (`Text` continuation context): appended to prior text where applicable.
-- `class 4, id 5` (`Text`): rendered to SVG text.
-- `class 4, id 6` (`Append Text`): appended to prior text runs.
-- `class 4, id 7` (`Polygon`): rendered to SVG polygons.
-- `class 4, id 8` (`Polygon Set`): rendered as polygon geometry.
-- `class 4, id 9` (`Cell Array`): extracted as `RawImage` payloads and used as raster candidates.
-- `class 4, id 10` and `id 26` (`GDP`-like primitives): decoded as polyline-style vectors.
-- `class 4, id 11` (`Rectangle`): rendered as SVG rect.
-- `class 4, id 12` (`Circle`): rendered as SVG circle.
-- `class 4, ids 13-16, 18-25, 27` (arc families): rendered as best-effort polyline geometry.
-- `class 4, id 17` (`Ellipse`): rendered as SVG ellipse.
-- `class 4, id 28`: parsed but no strict vector fallback rendering.
-- `class 4, id 29` (`Restricted Text` or modeled prefixed raster payload): restricted text is rendered when text payload decodes; non-text payloads are raster-decoded only when their prefix matches known sample-derived profiles.
-- `class 5, id 3` (`Line Width`): applied to SVG stroke width.
-- `class 5, id 4` (`Line Color`): applied via palette/index mapping.
-- `class 5, id 15` (`Character Height`): applied to SVG text size.
-- `class 5, id 34` (`Color Table`): used for indexed palette and color mapping.
-- `class 9, id 1` (`Application Data` / APD): used for hotspot `name`/`region` extraction.
-- `class 0, id 21/22/23` (APS begin/end forms): used for hotspot grouping.
+- `class-1/id-3` (`VDC Type`): used to choose coordinate decoding path.
+- `class-1/id-10` (`Color Value Extent`): used for 16-bit direct-color scaling.
+- `class-1/id-11` (`VDC Integer Precision`): used for strict integer VDC decode.
+- `class-1/id-12` (`VDC Real Precision`): used for strict real VDC decode.
+- `class-2/id-6` (`VDC Extent`): used to set SVG view extents and raster placement.
+- `class-0/id-19/20` (`Begin/End Tile Array` wrappers): used to parse binary tile-array headers and wrapper-scoped raster dimensions.
+- `class-3/id-4` (`Transparency`): mapped to SVG background behavior.
+- `class-3/id-5` (`Clip Rectangle`): mapped to SVG clip paths.
+- `class-3/id-6` (`Clip Indicator`): enables/disables clipping.
+- `class-4/id-1` (`Polyline`): rendered to SVG polylines.
+- `class-4/id-2` (`Disjoint Polyline`): rendered as segment polylines.
+- `class-4/id-3` (`Polymarker`): rendered as SVG marker circles.
+- `class-4/id-4` (`Text` continuation context): appended to prior text where applicable.
+- `class-4/id-5` (`Text`): rendered to SVG text.
+- `class-4/id-6` (`Append Text`): appended to prior text runs.
+- `class-4/id-7` (`Polygon`): rendered to SVG polygons.
+- `class-4/id-8` (`Polygon Set`): rendered as polygon geometry.
+- `class-4/id-9` (`Cell Array`): extracted as `RawImage` payloads and used as raster candidates.
+- `class-4/id-10` and `class-4/id-26` (`GDP`-like primitives): decoded as polyline-style vectors.
+- `class-4/id-11` (`Rectangle`): rendered as SVG rect.
+- `class-4/id-12` (`Circle`): rendered as SVG circle.
+- `class-4/id-13..16`, `class-4/id-18..25`, `class-4/id-27` (arc families): rendered as best-effort polyline geometry.
+- `class-4/id-17` (`Ellipse`): rendered as SVG ellipse.
+- `class-4/id-28`: parsed as binary tile payload records for raster composition.
+- `class-4/id-29` (`Restricted Text` or modeled prefixed raster payload): restricted text is rendered when text payload decodes; non-text payloads are raster-decoded only when their prefix matches known sample-derived profiles. When class-4/id-29 is inside a 1x1 binary tile-array wrapper (`class-0/id-19..20`), wrapper tile dimensions are used for raster decode.
+- `class-5/id-3` (`Line Width`): applied to SVG stroke width.
+- `class-5/id-4` (`Line Color`): applied via palette/index mapping.
+- `class-5/id-15` (`Character Height`): applied to SVG text size.
+- `class-5/id-34` (`Color Table`): used for indexed palette and color mapping.
+- `class-9/id-1` (`Application Data` / APD): used for hotspot `name`/`region` extraction.
+- `class-0/id-21/22/23` (APS begin/end forms): used for hotspot grouping.
 
 ### Clear-Text Command Coverage
 
@@ -186,7 +187,8 @@ and clear-text CGM workflows.
 - Decodes bitonal raster data for uncompressed, CCITT Group 3, and CCITT Group 4 paths.
 - Decodes indexed-color and direct-color tile payloads when dimensions/precision are usable.
 - Composes raster backgrounds into SVG (embedded PNG data URI) before vector overlays.
-- For multi-payload class 4, id 29 rasters, emits separate SVG `<image>` tile overlays when a simple inferred tile grid decodes successfully.
+- For single-payload id-29 rasters inside 1x1 binary tile-array wrappers, decodes at wrapper tile dimensions and then maps to VDC extent in SVG.
+- For multi-payload class-4/id-29 rasters, emits separate SVG `<image>` tile overlays when a simple inferred tile grid decodes successfully.
 
 ### Hotspot Features
 

@@ -188,6 +188,17 @@ def _collect_element29_raster_payloads(
     tuple[int, int] | None,
     list[tuple[int, int, int, int, bytes, int | None, int | None]],
 ]:
+    """Collect non-text id-29 payloads plus decode-size hints.
+
+    Returns the VDC-extent size hint and a payload list containing:
+    ``(compression, row_padding, bit_order, orientation, payload,
+    decode_width_hint, decode_height_hint)``.
+
+    For payloads inside a binary tile-array wrapper (class-0/id-19..20) with
+    a 1x1 header, decode-size hints are taken from ``tile_width`` and
+    ``tile_height`` so decoding can occur at the encoded raster dimensions
+    instead of the final VDC display extent.
+    """
     vdc_extent: tuple[float, float, float, float] | None = None
     payloads: list[tuple[int, int, int, int, bytes, int | None, int | None]] = []
     active_tile_header: dict[str, int] | None = None
@@ -200,6 +211,8 @@ def _collect_element29_raster_payloads(
             continue
 
         if element.class_id == 0 and element.element_id == 19:
+            # Binary tile-array begin: keep header active until id-20 so class-4/id-29
+            # payloads within this block can use encoded tile dimensions.
             active_tile_header = _parse_binary_tile_array_header(element.parameters)
             continue
 
@@ -233,6 +246,12 @@ def _collect_element29_raster_payloads(
 def _render_element29_overlays(
     data: bytes,
 ) -> tuple[list[tuple[str, float, float, float, float]], int, int] | None:
+    """Decode multi-payload id-29 rasters into SVG tile overlays.
+
+    Overlay placement is based on inferred grid positions in VDC space, while
+    individual payload decode dimensions may use wrapper hints collected from
+    class-0/id-19 tile-array headers when available.
+    """
     size_hint, payloads = _collect_element29_raster_payloads(data)
     if size_hint is None or len(payloads) < 2:
         return None
@@ -283,6 +302,11 @@ def _render_element29_overlays(
 def _render_first_element29_raster(
     data: bytes,
 ) -> Any | None:
+    """Decode the first usable non-text id-29 raster payload.
+
+    Uses VDC extent dimensions by default, but prefers 1x1 binary tile-array
+    wrapper dimensions (class-0/id-19 header) when present.
+    """
     size_hint, payloads = _collect_element29_raster_payloads(data)
     if size_hint is None:
         return None

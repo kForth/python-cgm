@@ -270,7 +270,12 @@ def _finalize_tile_array_record(array: dict[str, object]) -> dict[str, object] |
 
 
 def _parse_tile_arrays(data: bytes) -> list[dict[str, object]]:
-    """Parse tile-array metadata from text commands or binary id-28 blocks."""
+    """Parse tile-array metadata from clear-text commands or binary wrappers.
+
+    Binary parsing targets class-0/id-19..20 blocks that contain class-4/id-28
+    tile payloads, and also exposes header dimensions reused by id-29 wrapper
+    decoding paths.
+    """
     text_arrays = _parse_text_tile_arrays(data)
     if text_arrays:
         return text_arrays
@@ -278,7 +283,12 @@ def _parse_tile_arrays(data: bytes) -> list[dict[str, object]]:
 
 
 def _parse_binary_tile_array_header(parameters: bytes) -> dict[str, int] | None:
-    """Parse the stable 32-byte binary tile-array header used in the corpus."""
+    """Parse the corpus-stable 32-byte binary tile-array header.
+
+    The returned dimensions are used by id-28 tile-array composition and by
+    id-29 wrapper-aware raster decode in files where class-4/id-29 is nested
+    inside class-0/id-19..20 tile-array blocks.
+    """
     if len(parameters) < 32:
         return None
 
