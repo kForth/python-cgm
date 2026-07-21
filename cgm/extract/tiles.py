@@ -713,15 +713,14 @@ def _decode_bitonal_payload_with_details(
         }
 
     if compression == 2:
-        eofb_bit = _find_t6_eofb_bit_offset(payload)
-        payload_bits = len(payload) * 8
-        eofb_near_end = eofb_bit is not None and eofb_bit >= payload_bits * 0.8
-
+        preferred_width = width
         try_widths: list[int] = [width]
         if isinstance(row_padding, int) and row_padding > 8:
-            try_widths.append(width + row_padding // 2)
+            preferred_width = width + row_padding // 2
+            try_widths = [preferred_width, width, width + row_padding]
         elif isinstance(row_padding, int) and 0 < row_padding <= 8:
-            try_widths.append(width + row_padding)
+            preferred_width = width + row_padding
+            try_widths = [preferred_width, width]
 
         seen_w: set[int] = set()
         unique_widths: list[int] = []
@@ -730,11 +729,11 @@ def _decode_bitonal_payload_with_details(
                 seen_w.add(w_val)
                 unique_widths.append(w_val)
 
-        def _fax4_try(w_val: int) -> tuple[Image.Image | None, int, int]:
+        def _fax4_try(w_val: int) -> tuple[Image.Image | None, int, int, float]:
             inf = height + 1
             raw = _cached_ccittfax4_decode(payload, height=height, width=w_val)
             if raw is None:
-                return None, inf, inf
+                return None, inf, inf, 1.0
             if w_val > width:
                 stripped = bytearray()
                 for row_idx in range(height):
@@ -742,7 +741,7 @@ def _decode_bitonal_payload_with_details(
                 raw = bytes(stripped)
             bits = _decode_fax_output_to_bitmap(raw, width, height)
             if bits is None:
-                return None, inf, inf
+                return None, inf, inf, 1.0
             sbr = sum(
                 1
                 for row_idx in range(height)
@@ -754,50 +753,17 @@ def _decode_bitonal_payload_with_details(
                     twr += 1
                 else:
                     break
+            right_black = (
+                sum(bits[row_idx * width + (width - 1)] for row_idx in range(height)) / height
+            )
             px = bytes(0 if bit else 255 for bit in bits)
-            return Image.frombytes("L", (width, height), px), sbr, twr
+            return Image.frombytes("L", (width, height), px), sbr, twr, right_black
 
-        candidates: list[tuple[int, Image.Image, int, int]] = []
-
-        if eofb_near_end:
-            nom_img, nom_sbr, nom_twr = _fax4_try(width)
-            if nom_img is not None:
-                candidates.append((width, nom_img, nom_sbr, nom_twr))
-                if nom_sbr == 0 and nom_twr == 0:
-                    return nom_img, {
-                        "best_score": None,
-                        "candidate_count": 1,
-                        "best_candidate": {
-                            "decoder": "fax4",
-                            "encoded_variant": "as_is",
-                            "width": width,
-                            "height": height,
-                            "invert": False,
-                            "score": None,
-                        },
-                        "preferred_signature": preferred_signature,
-                        "preferred_dimensions": preferred_dimensions,
-                        "used_preferred_signature": False,
-                        "attempts": [
-                            {
-                                "decoder": "fax4",
-                                "encoded_variant": "as_is",
-                                "width": width,
-                                "height": height,
-                                "invert": False,
-                                "score": None,
-                            }
-                        ],
-                    }
-            for w_val in unique_widths[1:]:
-                img, sbr, twr = _fax4_try(w_val)
-                if img is not None:
-                    candidates.append((w_val, img, sbr, twr))
-        else:
-            for w_val in unique_widths:
-                img, sbr, twr = _fax4_try(w_val)
-                if img is not None:
-                    candidates.append((w_val, img, sbr, twr))
+        candidates: list[tuple[int, Image.Image, int, int, float]] = []
+        for w_val in unique_widths:
+            img, sbr, twr, right_black = _fax4_try(w_val)
+            if img is not None:
+                candidates.append((w_val, img, sbr, twr, right_black))
 
         if not candidates:
             return None, {
@@ -810,15 +776,32 @@ def _decode_bitonal_payload_with_details(
                 "attempts": [],
             }
 
-        nom = next((twr for w_val, _, _sbr, twr in candidates if w_val == width), height)
+        nom = next(
+            (twr for w_val, _, _sbr, twr, _right_black in candidates if w_val == preferred_width),
+            next(
+                (twr for w_val, _, _sbr, twr, _right_black in candidates if w_val == width), height
+            ),
+        )
         max_twr = nom + max(1, height // 10)
-        valid = [(w_val, img, sbr, twr) for w_val, img, sbr, twr in candidates if twr <= max_twr]
+        valid = [
+            (w_val, img, sbr, twr, right_black)
+            for w_val, img, sbr, twr, right_black in candidates
+            if twr <= max_twr
+        ]
         if not valid:
             valid = [
-                (w_val, img, sbr, twr) for w_val, img, sbr, twr in candidates if w_val == width
+                (w_val, img, sbr, twr, right_black)
+                for w_val, img, sbr, twr, right_black in candidates
+                if w_val == preferred_width
+            ]
+        if not valid:
+            valid = [
+                (w_val, img, sbr, twr, right_black)
+                for w_val, img, sbr, twr, right_black in candidates
+                if w_val == width
             ]
 
-        _, best_img, _, _ = min(valid, key=lambda item: (item[2], item[3]))
+        _, best_img, _, _, _ = min(valid, key=lambda item: (item[2], item[4], item[3]))
 
         return best_img, {
             "best_score": None,
