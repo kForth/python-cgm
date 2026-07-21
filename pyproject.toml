@@ -51,7 +51,7 @@ dev = [
     "ruff==0.15.*",
 ]
 test = [
-    "pytest>=8.4,<9.2",
+    "pytest>=9.1.1,<9.2",
 ]
 
 [tool.setuptools.dynamic]
