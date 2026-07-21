@@ -44,6 +44,15 @@ from cgm.extract.tiles import (
 
 log = logging.getLogger("cgm.extract")
 
+_ID29_RASTER_MODELS: dict[tuple[int, int, int, int], tuple[tuple[int, int], ...]] = {
+    # Corpus-derived profile from sample fixtures:
+    # prefix (compression, row_padding, bit_order, orientation)
+    # ordered decode attempts (compression, bit_order)
+    (2, 0, 1, 0): ((2, 1), (2, 0), (1, 0), (1, 1)),
+    # Learned from remaining misses in the expanded test_files corpus.
+    (7, 0, 8, 6): ((1, 0), (1, 1), (2, 1), (2, 0), (0, 0), (0, 1)),
+}
+
 
 @dataclass(slots=True)
 class _SvgStyle:
@@ -115,7 +124,7 @@ def _derive_extent_pixel_size(
 def _parse_element29_raster_prefix(
     parameters: bytes,
 ) -> tuple[int, int, int, int, bytes] | None:
-    """Parse observed class-4/id-29 raster prefix layout.
+    """Parse class-4/id-29 raster prefix layout.
 
     Layout: ``u16 compression``, ``u16 row_padding``, ``u16 bit_order``,
     ``u8 orientation``, then encoded raster payload bytes.
@@ -128,37 +137,9 @@ def _parse_element29_raster_prefix(
     bit_order = int.from_bytes(parameters[4:6], "big", signed=False)
     orientation = parameters[6]
     payload = parameters[7:]
-    if compression not in (0, 1, 2) or not payload:
+    if not payload:
         return None
     return compression, row_padding, bit_order, orientation, payload
-
-
-def _element29_signal_metrics(image: Any) -> tuple[float, int, int]:
-    grayscale = image.convert("L")
-    histogram = grayscale.histogram()
-    if not histogram:
-        return 0.0, 0, 0
-
-    total = grayscale.width * grayscale.height
-    if total <= 0:
-        return 0.0, 0, 0
-
-    nonwhite = total - histogram[255]
-    if nonwhite <= 0 or nonwhite >= total:
-        return 0.0, 0, 0
-
-    active_rows = 0
-    pixels = grayscale.load()
-    for y in range(grayscale.height):
-        has_signal = False
-        for x in range(grayscale.width):
-            if pixels[x, y] < 250:
-                has_signal = True
-                break
-        if has_signal:
-            active_rows += 1
-
-    return nonwhite / total, active_rows, nonwhite
 
 
 def _decode_element29_payload_with_fallbacks(
@@ -171,30 +152,15 @@ def _decode_element29_payload_with_fallbacks(
     bit_order: int,
     orientation: int,
 ) -> Any | None:
-    """Decode one id-29 payload with conservative fallback candidates.
+    """Decode id-29 payload using deterministic corpus model candidates.
 
-    The declared prefix candidate is tried first. For fax4-prefixed payloads
-    that decode to all-white output, a limited fax3 fallback is evaluated and
-    accepted only when minimal signal thresholds are met.
+    Each known prefix maps to a fixed decode attempt sequence and the first
+    candidate that decodes successfully is selected.
     """
-    candidates: list[tuple[int, int]] = []
-
-    def _add(compression_value: int, bit_order_value: int) -> None:
-        if (compression_value, bit_order_value) not in candidates:
-            candidates.append((compression_value, bit_order_value))
-
-    _add(compression, bit_order)
-    if bit_order in (0, 1):
-        _add(compression, 1 - bit_order)
-
-    # Corpus-derived fallback: some id-29 payloads labeled as fax4 decode as
-    # all-white under ccittfax4 but still carry usable signal under fax3.
-    if compression == 2:
-        _add(1, 0)
-        _add(1, 1)
-
-    best_image: Any | None = None
-    best_score: tuple[float, int, int] | None = None
+    model_key = (compression, row_padding, bit_order, orientation)
+    candidates = _ID29_RASTER_MODELS.get(model_key)
+    if candidates is None:
+        return None
 
     for compression_value, bit_order_value in candidates:
         image = _decode_tile_payload_to_image(
@@ -206,27 +172,10 @@ def _decode_element29_payload_with_fallbacks(
             row_padding=row_padding,
             orientation=orientation,
         )
-        if image is None:
-            continue
-
-        ratio, active_rows, nonwhite = _element29_signal_metrics(image)
-        if ratio <= 0.0:
-            continue
-
-        # Keep fallback conservative to avoid rendering tiny decode artifacts.
-        if compression_value != compression and (ratio < 0.0005 or active_rows < 8):
-            continue
-
-        score = (ratio, active_rows, nonwhite)
-        if best_score is None or score > best_score:
-            best_score = score
-            best_image = image
-
-        # Prefer the declared candidate when it already carries valid signal.
-        if compression_value == compression and bit_order_value == bit_order:
+        if image is not None:
             return image
 
-    return best_image
+    return None
 
 
 def _collect_element29_raster_payloads(

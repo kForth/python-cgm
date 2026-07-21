@@ -33,7 +33,7 @@ pip install python-cgm
 - Parses binary and clear-text CGM command streams.
 - Finds `Cell Array` elements (class 4, element 9) and extracts their raw payload bytes.
 - Decodes clear-text tiled bitonal, indexed, and direct-color arrays.
-- Decodes prefixed class 4, id 29 raster payloads with conservative fallback candidates.
+- Decodes prefixed class 4, id 29 raster payloads using a fixed sample-derived decode model.
 - Builds a final SVG output that can include an embedded raster background.
 - Converts vector-like CGM drawing primitives into SVG overlays.
 - Extracts hotspots from APD `name`/`region` records and APS geometry groups.
@@ -159,7 +159,7 @@ and clear-text CGM workflows.
 - `class 4, ids 13-16, 18-25, 27` (arc families): rendered as best-effort polyline geometry.
 - `class 4, id 17` (`Ellipse`): rendered as SVG ellipse.
 - `class 4, id 28`: parsed but no strict vector fallback rendering.
-- `class 4, id 29` (`Restricted Text` or prefixed raster payload): restricted text is rendered when text payload decodes; non-text prefixed payloads are evaluated as raster candidates.
+- `class 4, id 29` (`Restricted Text` or modeled prefixed raster payload): restricted text is rendered when text payload decodes; non-text payloads are raster-decoded only when their prefix matches known sample-derived profiles.
 - `class 5, id 3` (`Line Width`): applied to SVG stroke width.
 - `class 5, id 4` (`Line Color`): applied via palette/index mapping.
 - `class 5, id 15` (`Character Height`): applied to SVG text size.
@@ -197,7 +197,7 @@ and clear-text CGM workflows.
 
 - The exact supported CGM elements/commands are listed in the Supported CGM Elements And Features section above.
 - This project is extraction-oriented: it parses and exports data/SVG/JSON, but does **not** support CGM authoring or round-trip editing.
-- Rendering is best-effort for many real-world files; unsupported or profile-specific constructs may be skipped rather than heuristically rewritten.
+- Rendering is best-effort for many real-world files; unsupported or profile-specific constructs may be skipped rather than guessed from heuristic rewrites.
 - Raster composition is metadata-dependent. Clear-text tile arrays are composed directly; binary Cell Array payloads are extracted and used as raster candidates.
 - Raster decoding requires runtime dependencies `Pillow` and `imagecodecs` (installed with this package by default).
 - JSON exports can be large because they include full element parameter and payload hex data.
