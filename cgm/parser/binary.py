@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+__author__ = "Kestin Goforth"
+__copyright__ = "Copyright 2026"
+__license__ = "BSD-3-Clause"
+
 import logging
 from typing import TYPE_CHECKING
 
