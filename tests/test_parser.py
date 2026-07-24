@@ -29,6 +29,24 @@ def test_iter_elements_parses_short_form_with_padding() -> None:
     assert element.offset == 0
 
 
+def test_iter_elements_returns_no_elements_for_empty_input() -> None:
+    elements = list(iter_elements(b""))
+
+    assert elements == []
+
+
+def test_iter_elements_treats_binary_data_with_semicolons_as_binary() -> None:
+    params = b"abc;def"
+    data = _header(4, 9, len(params)) + params + b"\x00"
+
+    elements = list(iter_elements(data))
+
+    assert len(elements) == 1
+    assert elements[0].class_id == 4
+    assert elements[0].element_id == 9
+    assert elements[0].parameters == params
+
+
 def test_iter_elements_parses_long_form_chunked_parameters() -> None:
     payload = b"hello"
     chunk_header = len(payload).to_bytes(2, "big")
