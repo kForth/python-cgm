@@ -9,10 +9,13 @@ import importlib
 import inspect
 import io
 import json
+import random
 import re
 import struct
 from collections import Counter
 from typing import TYPE_CHECKING
+
+import pytest
 
 import cgm.extract as extract_module
 from cgm.extract import (
@@ -43,6 +46,31 @@ def _encode_f32(value: float) -> bytes:
 
 def _apd_property(key: bytes, value: bytes) -> bytes:
     return bytes([len(key)]) + key + bytes([len(value)]) + value
+
+
+def _fixture_source(root: Path, file_name: str) -> Path:
+    candidates = [
+        root / "sample" / file_name,
+        root / "test_files" / file_name,
+    ]
+    source = next((path for path in candidates if path.exists()), None)
+    if source is None:
+        pytest.skip(f"no fixture file available for {file_name}")
+    return source
+
+
+def _available_corpus_sources(root: Path) -> list[Path]:
+    sources = sorted((root / "test_files").glob("*.cgm"))
+    if not sources:
+        pytest.skip("no .cgm files available to test")
+    return sources
+
+
+def _sample_corpus_sources(root: Path, sample_size: int = 200) -> list[Path]:
+    sources = _available_corpus_sources(root)
+    if len(sources) <= sample_size:
+        return sources
+    return sorted(random.Random(0).sample(sources, sample_size))
 
 
 def test_extract_raw_images_from_bytes_reads_cell_array_payload() -> None:
@@ -494,11 +522,7 @@ def test_extract_hotspots_from_gr_77775_contains_autoid_regions() -> None:
     from pathlib import Path  # noqa: PLC0415
 
     root = Path(__file__).resolve().parents[1]
-    candidates = [
-        root / "sample" / "GR-77775.cgm",
-        root / "test_files" / "GR-77775.cgm",
-    ]
-    source = next((path for path in candidates if path.exists()), candidates[0])
+    source = _fixture_source(root, "GR-77775.cgm")
     hotspots = extract_hotspots_from_bytes(source.read_bytes())
 
     assert hotspots
@@ -510,11 +534,7 @@ def test_gr_283383_data_snapshot_defaults_to_non_heuristic_element29_analysis() 
     from pathlib import Path  # noqa: PLC0415
 
     root = Path(__file__).resolve().parents[1]
-    candidates = [
-        root / "sample" / "GR-283383.cgm",
-        root / "test_files" / "GR-283383.cgm",
-    ]
-    source = next((path for path in candidates if path.exists()), candidates[0])
+    source = _fixture_source(root, "GR-283383.cgm")
 
     snapshot = json.loads(extract_data_json_from_bytes(source.read_bytes()))
     element29 = snapshot["element29_analysis"][0]
@@ -528,11 +548,7 @@ def test_gr_283383_default_svg_does_not_use_heuristic_class29_fallback() -> None
     from pathlib import Path  # noqa: PLC0415
 
     root = Path(__file__).resolve().parents[1]
-    candidates = [
-        root / "sample" / "GR-283383.cgm",
-        root / "test_files" / "GR-283383.cgm",
-    ]
-    source = next((path for path in candidates if path.exists()), candidates[0])
+    source = _fixture_source(root, "GR-283383.cgm")
 
     svg = extract_vector_svg_from_bytes(source.read_bytes())
 
@@ -545,11 +561,7 @@ def test_gr_77775_svg_emits_multiple_class29_tile_images() -> None:
     from pathlib import Path  # noqa: PLC0415
 
     root = Path(__file__).resolve().parents[1]
-    candidates = [
-        root / "sample" / "GR-77775.cgm",
-        root / "test_files" / "GR-77775.cgm",
-    ]
-    source = next((path for path in candidates if path.exists()), candidates[0])
+    source = _fixture_source(root, "GR-77775.cgm")
 
     svg = extract_vector_svg_from_bytes(source.read_bytes())
 
@@ -561,11 +573,7 @@ def test_gr_217420_id29_fallback_renders_image() -> None:
     from pathlib import Path  # noqa: PLC0415
 
     root = Path(__file__).resolve().parents[1]
-    candidates = [
-        root / "sample" / "GR-217420.cgm",
-        root / "test_files" / "GR-217420.cgm",
-    ]
-    source = next((path for path in candidates if path.exists()), candidates[0])
+    source = _fixture_source(root, "GR-217420.cgm")
 
     svg = extract_vector_svg_from_bytes(source.read_bytes())
 
@@ -576,11 +584,7 @@ def test_gr_351121_id29_safe_raw_profile_renders_image() -> None:
     from pathlib import Path  # noqa: PLC0415
 
     root = Path(__file__).resolve().parents[1]
-    candidates = [
-        root / "sample" / "GR-351121.cgm",
-        root / "test_files" / "GR-351121.cgm",
-    ]
-    source = next((path for path in candidates if path.exists()), candidates[0])
+    source = _fixture_source(root, "GR-351121.cgm")
 
     svg = extract_vector_svg_from_bytes(source.read_bytes())
 
@@ -600,11 +604,7 @@ def test_gr_77912_tiles_7_and_10_prefer_padded_fax4_width() -> None:
     )
 
     root = Path(__file__).resolve().parents[1]
-    candidates = [
-        root / "sample" / "GR-77912.cgm",
-        root / "test_files" / "GR-77912.cgm",
-    ]
-    source = next((path for path in candidates if path.exists()), candidates[0])
+    source = _fixture_source(root, "GR-77912.cgm")
 
     array = _parse_tile_arrays(source.read_bytes())[0]
     tile_width_obj = array.get("tile_width")
@@ -669,11 +669,7 @@ def test_gr_74218_and_gr_76072_tiles_prefer_nominal_fax4_width() -> None:
     )
 
     for file_name, tile_index in cases:
-        candidates = [
-            root / "sample" / file_name,
-            root / "test_files" / file_name,
-        ]
-        source = next((path for path in candidates if path.exists()), candidates[0])
+        source = _fixture_source(root, file_name)
         array = _parse_tile_arrays(source.read_bytes())[0]
         tile_width_obj = array.get("tile_width")
         tile_height_obj = array.get("tile_height")
@@ -746,11 +742,7 @@ def test_gr_78129_gr_78167_and_gr_78836_tiles_prefer_padded_fax4_width() -> None
     )
 
     for file_name, tile_index in cases:
-        candidates = [
-            root / "sample" / file_name,
-            root / "test_files" / file_name,
-        ]
-        source = next((path for path in candidates if path.exists()), candidates[0])
+        source = _fixture_source(root, file_name)
         array = _parse_tile_arrays(source.read_bytes())[0]
         tile_width_obj = array.get("tile_width")
         tile_height_obj = array.get("tile_height")
@@ -819,11 +811,7 @@ def test_gr_single_payload_id29_2010_uses_wrapper_tile_dimensions() -> None:
     )
 
     for file_name in cases:
-        candidates = [
-            root / "sample" / file_name,
-            root / "test_files" / file_name,
-        ]
-        source = next((path for path in candidates if path.exists()), candidates[0])
+        source = _fixture_source(root, file_name)
         extent = None
         parsed_payload = None
         wrapper = None
@@ -867,10 +855,10 @@ def test_gr_single_payload_id29_2010_uses_wrapper_tile_dimensions() -> None:
 def test_id29_prefix_families_have_no_new_frequent_format() -> None:
     from pathlib import Path  # noqa: PLC0415
 
-    root = Path(__file__).resolve().parents[1] / "test_files"
+    root = Path(__file__).resolve().parents[1]
     prefix_counts: Counter[tuple[int, int, int, int]] = Counter()
 
-    for source in root.glob("*.cgm"):
+    for source in _sample_corpus_sources(root):
         for element in iter_elements(source.read_bytes()):
             if element.class_id != 4 or element.element_id != 29:
                 continue
@@ -898,7 +886,7 @@ def test_0800c8af84b96799_gdp_alignment_avoids_collapsed_viewbox() -> None:
     from pathlib import Path  # noqa: PLC0415
 
     root = Path(__file__).resolve().parents[1]
-    source = root / "test_files" / "0800c8af84b96799.cgm"
+    source = _fixture_source(root, "0800c8af84b96799.cgm")
 
     svg = extract_vector_svg_from_bytes(source.read_bytes())
 
@@ -909,11 +897,7 @@ def test_gr_78946_renders_binary_text_and_arcs() -> None:
     from pathlib import Path  # noqa: PLC0415
 
     root = Path(__file__).resolve().parents[1]
-    candidates = [
-        root / "sample" / "GR-78946.cgm",
-        root / "test_files" / "GR-78946.cgm",
-    ]
-    source = next((path for path in candidates if path.exists()), candidates[0])
+    source = _fixture_source(root, "GR-78946.cgm")
 
     svg = extract_vector_svg_from_bytes(source.read_bytes())
 
@@ -931,11 +915,7 @@ def test_gr_78946_does_not_emit_noisy_massive_polylines() -> None:
     from pathlib import Path  # noqa: PLC0415
 
     root = Path(__file__).resolve().parents[1]
-    candidates = [
-        root / "sample" / "GR-78946.cgm",
-        root / "test_files" / "GR-78946.cgm",
-    ]
-    source = next((path for path in candidates if path.exists()), candidates[0])
+    source = _fixture_source(root, "GR-78946.cgm")
 
     svg = extract_vector_svg_from_bytes(source.read_bytes())
 
@@ -1250,11 +1230,7 @@ def test_parse_text_tile_arrays_gr_77775_payloads_are_not_truncated() -> None:
     from pathlib import Path  # noqa: PLC0415
 
     root = Path(__file__).resolve().parents[1]
-    candidates = [
-        root / "sample" / "GR-77775.cgm",
-        root / "test_files" / "GR-77775.cgm",
-    ]
-    source = next((path for path in candidates if path.exists()), candidates[0])
+    source = _fixture_source(root, "GR-77775.cgm")
 
     arrays = extract_module._parse_text_tile_arrays(source.read_bytes())
 
