@@ -3,7 +3,6 @@
 __author__ = "Kestin Goforth"
 __copyright__ = "Copyright 2026"
 __license__ = "BSD-3-Clause"
-__version__ = "0.3.6"
 
 import logging
 
