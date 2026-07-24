@@ -10,10 +10,13 @@ from typing import TYPE_CHECKING
 
 from click.testing import CliRunner
 
+import cgm.cli as cli_module
 from cgm.cli import cli
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import pytest
 
 
 def _header(class_id: int, element_id: int, length: int) -> bytes:
@@ -119,3 +122,24 @@ def test_cli_accepts_clear_text_cgm(tmp_path: Path) -> None:
     hotspot_json = json.loads((out_dir / "in_0000.hotspots.json").read_text(encoding="utf-8"))
     assert hotspot_json
     assert hotspot_json[0]["name"] == "ZONE"
+
+
+def test_cli_converts_runtime_error_to_click_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    src = tmp_path / "in.cgm"
+    out_dir = tmp_path / "out"
+    src.write_bytes(_make_cell_array(b"PAY"))
+
+    def _raise_runtime_error(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(cli_module, "extract_rendered_images_to_directory", _raise_runtime_error)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, [str(src), str(out_dir)])
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, SystemExit)
+    assert "Error: boom" in result.output
