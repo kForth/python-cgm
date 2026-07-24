@@ -765,7 +765,7 @@ def extract_vector_svg_from_bytes(
             svg_lines.append(
                 f'  <image x="{mapped_x:.3f}" y="{mapped_y:.3f}" '
                 f'width="{mapped_w:.3f}" height="{mapped_h:.3f}" preserveAspectRatio="none" '
-                f'image-rendering="pixelated" href="{href}"{clip_attr} />'
+                f'image-rendering="optimizeQuality" href="{href}"{clip_attr} />'
             )
     elif element29_overlays is not None:
         tile_entries, tile_total_w, tile_total_h = element29_overlays
@@ -781,14 +781,14 @@ def extract_vector_svg_from_bytes(
             svg_lines.append(
                 f'  <image x="{mapped_x:.3f}" y="{mapped_y:.3f}" '
                 f'width="{mapped_w:.3f}" height="{mapped_h:.3f}" preserveAspectRatio="none" '
-                f'image-rendering="pixelated" href="{href}"{clip_attr} />'
+                f'image-rendering="optimizeQuality" href="{href}"{clip_attr} />'
             )
     elif raster_background is not None:
         href, _raster_w, _raster_h = raster_background
         svg_lines.append(
             f'  <image x="{min_x:.3f}" y="{min_y:.3f}" width="{width:.3f}" '
             f'height="{height:.3f}" preserveAspectRatio="xMidYMid meet" '
-            f'image-rendering="pixelated" href="{href}"{clip_attr} />'
+            f'image-rendering="optimizeQuality" href="{href}"{clip_attr} />'
         )
 
     svg_lines.append(f'  <g fill="none" stroke-linecap="round" stroke-linejoin="round"{clip_attr}>')
