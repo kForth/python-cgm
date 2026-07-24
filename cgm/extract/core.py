@@ -402,9 +402,14 @@ def scale_component_to_byte(value: int, *, bits: int) -> int:
     return max(0, min(255, round((value / max_value) * 255.0)))
 
 
-def extract_color_table(data: bytes) -> dict[int, tuple[int, int, int]]:
+def extract_color_table(
+    data: bytes,
+    *,
+    elements: list[CGMElement] | None = None,
+) -> dict[int, tuple[int, int, int]]:
     table: dict[int, tuple[int, int, int]] = {}
-    for element in iter_elements(data):
+    source_elements = iter_elements(data) if elements is None else elements
+    for element in source_elements:
         if element.class_id == 5 and element.element_id == 34:
             table.update(decode_color_table_parameters(element.parameters))
     return table
@@ -428,9 +433,14 @@ def decode_color_value_extent_parameters(
     return None
 
 
-def extract_color_value_extent(data: bytes) -> tuple[int, int, int, int, int, int] | None:
+def extract_color_value_extent(
+    data: bytes,
+    *,
+    elements: list[CGMElement] | None = None,
+) -> tuple[int, int, int, int, int, int] | None:
     extent: tuple[int, int, int, int, int, int] | None = None
-    for element in iter_elements(data):
+    source_elements = iter_elements(data) if elements is None else elements
+    for element in source_elements:
         if element.class_id == 1 and element.element_id == 10:
             decoded = decode_color_value_extent_parameters(element.parameters)
             if decoded is not None:

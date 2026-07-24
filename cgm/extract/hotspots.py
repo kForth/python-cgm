@@ -9,6 +9,7 @@ __license__ = "BSD-3-Clause"
 import json
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from cgm.extract.core import (
     decode_application_property,
@@ -22,10 +23,17 @@ from cgm.extract.svg import extract_vector_svg
 from cgm.parser import iter_elements
 from cgm.types import HotSpot
 
+if TYPE_CHECKING:
+    from cgm.types import CGMElement
+
 log = logging.getLogger("cgm.extract")
 
 
-def extract_hotspots_from_bytes(data: bytes) -> list[HotSpot]:
+def extract_hotspots_from_bytes(
+    data: bytes,
+    *,
+    elements: list[CGMElement] | None = None,
+) -> list[HotSpot]:
     """Extract hotspot regions from APD application data and APS geometry elements."""
     hotspots: list[HotSpot] = []
 
@@ -96,7 +104,8 @@ def extract_hotspots_from_bytes(data: bytes) -> list[HotSpot]:
             )
         )
 
-    for element in iter_elements(data):
+    source_elements = iter_elements(data) if elements is None else elements
+    for element in source_elements:
         if element.class_id == 0 and element.element_id == 21:
             context_stack.append(_new_context(decode_prefixed_ascii(element.parameters)))
             continue
@@ -162,12 +171,16 @@ def extract_hotspots_to_directory(
     output_dir: str | Path,
     *,
     stem: str = "image",
+    elements: list[CGMElement] | None = None,
+    raw_data: bytes | None = None,
 ) -> Path:
     """Extract hotspot regions and write them as JSON into an output directory."""
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     target = out_dir / f"{stem}_0000.hotspots.json"
-    hotspots = extract_hotspots(file_path)
+    path = Path(file_path)
+    raw = raw_data if raw_data is not None else path.read_bytes()
+    hotspots = extract_hotspots_from_bytes(raw, elements=elements)
     payload = [
         {
             "index": item.index,

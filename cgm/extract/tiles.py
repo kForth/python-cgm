@@ -8,6 +8,7 @@ __license__ = "BSD-3-Clause"
 
 import re
 from functools import lru_cache
+from typing import TYPE_CHECKING
 
 import imagecodecs
 from PIL import Image
@@ -20,6 +21,9 @@ from cgm.extract.core import (
     scale_direct16_rgb_payload,
 )
 from cgm.parser import iter_elements
+
+if TYPE_CHECKING:
+    from cgm.types import CGMElement
 
 _TEXT_NUMBER_RE = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
 _TEXT_HEX_RUN_RE = re.compile(r"[0-9A-Fa-f]{32,}")
@@ -273,7 +277,11 @@ def _finalize_tile_array_record(array: dict[str, object]) -> dict[str, object] |
     ) | {"tiles": tiles}
 
 
-def _parse_tile_arrays(data: bytes) -> list[dict[str, object]]:
+def _parse_tile_arrays(
+    data: bytes,
+    *,
+    elements: list[CGMElement] | None = None,
+) -> list[dict[str, object]]:
     """Parse tile-array metadata from clear-text commands or binary wrappers.
 
     Binary parsing targets class-0/id-19..20 blocks that contain class-4/id-28
@@ -283,7 +291,7 @@ def _parse_tile_arrays(data: bytes) -> list[dict[str, object]]:
     text_arrays = _parse_text_tile_arrays(data)
     if text_arrays:
         return text_arrays
-    return _parse_binary_tile_arrays(data)
+    return _parse_binary_tile_arrays(data, elements=elements)
 
 
 def _parse_binary_tile_array_header(parameters: bytes) -> dict[str, int] | None:
@@ -336,12 +344,17 @@ def _parse_binary_id28_tile(parameters: bytes) -> dict[str, object] | None:
     }
 
 
-def _parse_binary_tile_arrays(data: bytes) -> list[dict[str, object]]:
+def _parse_binary_tile_arrays(
+    data: bytes,
+    *,
+    elements: list[CGMElement] | None = None,
+) -> list[dict[str, object]]:
     """Parse binary tile arrays wrapped around class-4/id-28 payloads."""
     arrays: list[dict[str, object]] = []
     current: dict[str, object] | None = None
+    source_elements = iter_elements(data) if elements is None else elements
 
-    for element in iter_elements(data):
+    for element in source_elements:
         if element.class_id == 0 and element.element_id == 19:
             header = _parse_binary_tile_array_header(element.parameters)
             if header is None:
@@ -859,11 +872,21 @@ def _decode_bitonal_payload_with_details(
     }
 
 
-def _render_first_tile_array(data: bytes) -> Image.Image | None:
-    indexed_palette = indexed_palette_bytes(extract_color_table(data))
-    color_value_extent = extract_color_value_extent(data)
+def _render_first_tile_array(
+    data: bytes,
+    *,
+    tile_arrays: list[dict[str, object]] | None = None,
+    indexed_palette: bytes | None = None,
+    color_value_extent: tuple[int, int, int, int, int, int] | None = None,
+) -> Image.Image | None:
+    palette = indexed_palette
+    if palette is None:
+        palette = indexed_palette_bytes(extract_color_table(data))
+    if color_value_extent is None:
+        color_value_extent = extract_color_value_extent(data)
 
-    for array in _parse_tile_arrays(data):
+    arrays = tile_arrays if tile_arrays is not None else _parse_tile_arrays(data)
+    for array in arrays:
         cols = coerce_int(array.get("cols", 1))
         rows = coerce_int(array.get("rows", 1))
         tile_w_nominal = coerce_int(array.get("tile_width", 1))
@@ -908,7 +931,7 @@ def _render_first_tile_array(data: bytes) -> Image.Image | None:
                 orientation=tile_payload.get("orientation")
                 if isinstance(tile_payload.get("orientation"), int)
                 else None,
-                indexed_palette=indexed_palette,
+                indexed_palette=palette,
                 color_value_extent=color_value_extent,
             )
             if tile_img is None:

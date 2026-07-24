@@ -23,8 +23,9 @@ def _build_data_snapshot(
     element_histogram: Counter[tuple[int, int]] = Counter()
     elements: list[dict[str, object]] = []
     element29_analysis: list[dict[str, object]] = []
+    parsed_elements = list(iter_elements(data))
 
-    for element in iter_elements(data):
+    for element in parsed_elements:
         key = (element.class_id, element.element_id)
         element_histogram[key] += 1
         elements.append(
@@ -46,8 +47,8 @@ def _build_data_snapshot(
                 }
             )
 
-    raw_images = extract_raw_images_from_bytes(data)
-    hotspots = extract_hotspots_from_bytes(data)
+    raw_images = extract_raw_images_from_bytes(data, elements=parsed_elements)
+    hotspots = extract_hotspots_from_bytes(data, elements=parsed_elements)
     raw_image_items = [
         {
             "index": image.index,
@@ -95,6 +96,7 @@ def _build_data_snapshot(
         "hotspots": hotspot_items,
         "vector_svg": extract_vector_svg_from_bytes(
             data,
+            elements=parsed_elements,
         ),
     }
 

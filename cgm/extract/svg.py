@@ -14,7 +14,7 @@ import html
 import io
 import logging
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cgm.parser import iter_elements
 from cgm.extract.core import (
@@ -47,6 +47,9 @@ from cgm.extract.tiles import (
     _render_first_tile_array,
 )
 
+if TYPE_CHECKING:
+    from cgm.types import CGMElement
+
 log = logging.getLogger("cgm.extract")
 
 _ID29_RASTER_MODELS: dict[tuple[int, int, int, int], tuple[tuple[int, int], ...]] = {
@@ -60,6 +63,9 @@ _ID29_RASTER_MODELS: dict[tuple[int, int, int, int], tuple[tuple[int, int], ...]
     # Learned from remaining misses in the expanded test_files corpus.
     (7, 0, 8, 6): ((1, 0), (1, 1), (2, 1), (2, 0), (0, 0), (0, 1)),
 }
+
+_MAX_ELEMENT29_OVERLAY_DECODE_PIXELS = 40_000_000
+_MAX_ELEMENT29_SINGLE_DECODE_PIXELS = 12_000_000
 
 
 @dataclass(slots=True)
@@ -129,6 +135,25 @@ def _derive_extent_pixel_size(
     return width, height
 
 
+def _cap_decode_dimensions(
+    width: int,
+    height: int,
+    *,
+    max_pixels: int,
+) -> tuple[int, int]:
+    if width <= 0 or height <= 0:
+        return max(1, width), max(1, height)
+
+    total = width * height
+    if total <= max_pixels:
+        return width, height
+
+    scale = (max_pixels / float(total)) ** 0.5
+    capped_w = max(1, round(width * scale))
+    capped_h = max(1, round(height * scale))
+    return capped_w, capped_h
+
+
 def _parse_element29_raster_prefix(
     parameters: bytes,
 ) -> tuple[int, int, int, int, bytes] | None:
@@ -188,6 +213,8 @@ def _decode_element29_payload_with_fallbacks(
 
 def _collect_element29_raster_payloads(
     data: bytes,
+    *,
+    elements: list[CGMElement] | None = None,
 ) -> tuple[
     tuple[int, int] | None,
     list[tuple[int, int, int, int, bytes, int | None, int | None]],
@@ -206,8 +233,9 @@ def _collect_element29_raster_payloads(
     vdc_extent: tuple[float, float, float, float] | None = None
     payloads: list[tuple[int, int, int, int, bytes, int | None, int | None]] = []
     active_tile_header: dict[str, int] | None = None
+    source_elements = iter_elements(data) if elements is None else elements
 
-    for element in iter_elements(data):
+    for element in source_elements:
         if element.class_id == 2 and element.element_id == 6:
             decoded_extent = decode_vdc_extent(element.parameters)
             if decoded_extent is not None:
@@ -249,6 +277,9 @@ def _collect_element29_raster_payloads(
 
 def _render_element29_overlays(
     data: bytes,
+    *,
+    size_hint: tuple[int, int] | None = None,
+    payloads: list[tuple[int, int, int, int, bytes, int | None, int | None]] | None = None,
 ) -> tuple[list[tuple[str, float, float, float, float]], int, int] | None:
     """Decode multi-payload id-29 rasters into SVG tile overlays.
 
@@ -256,7 +287,8 @@ def _render_element29_overlays(
     individual payload decode dimensions may use wrapper hints collected from
     class-0/id-19 tile-array headers when available.
     """
-    size_hint, payloads = _collect_element29_raster_payloads(data)
+    if size_hint is None or payloads is None:
+        size_hint, payloads = _collect_element29_raster_payloads(data)
     if size_hint is None or len(payloads) < 2:
         return None
 
@@ -264,6 +296,28 @@ def _render_element29_overlays(
     cols, rows = _infer_tile_grid(len(payloads), total_w, total_h)
     tile_w = max(1, total_w // max(1, cols))
     tile_h = max(1, total_h // max(1, rows))
+
+    estimated_decode_pixels = 0
+    for (
+        _compression,
+        _row_padding,
+        _bit_order,
+        _orientation,
+        _payload,
+        decode_w_hint,
+        decode_h_hint,
+    ) in payloads:
+        decode_w = decode_w_hint if isinstance(decode_w_hint, int) and decode_w_hint > 0 else tile_w
+        decode_h = decode_h_hint if isinstance(decode_h_hint, int) and decode_h_hint > 0 else tile_h
+        decode_w, decode_h = _cap_decode_dimensions(
+            decode_w,
+            decode_h,
+            max_pixels=_MAX_ELEMENT29_SINGLE_DECODE_PIXELS,
+        )
+        estimated_decode_pixels += decode_w * decode_h
+        if estimated_decode_pixels > _MAX_ELEMENT29_OVERLAY_DECODE_PIXELS:
+            return None
+
     overlays: list[tuple[str, float, float, float, float]] = []
 
     for tile_index, (
@@ -277,6 +331,11 @@ def _render_element29_overlays(
     ) in enumerate(payloads):
         decode_w = decode_w_hint if isinstance(decode_w_hint, int) and decode_w_hint > 0 else tile_w
         decode_h = decode_h_hint if isinstance(decode_h_hint, int) and decode_h_hint > 0 else tile_h
+        decode_w, decode_h = _cap_decode_dimensions(
+            decode_w,
+            decode_h,
+            max_pixels=_MAX_ELEMENT29_SINGLE_DECODE_PIXELS,
+        )
 
         tile_image = _decode_element29_payload_with_fallbacks(
             payload,
@@ -305,13 +364,17 @@ def _render_element29_overlays(
 
 def _render_first_element29_raster(
     data: bytes,
+    *,
+    size_hint: tuple[int, int] | None = None,
+    payloads: list[tuple[int, int, int, int, bytes, int | None, int | None]] | None = None,
 ) -> Any | None:
     """Decode the first usable non-text id-29 raster payload.
 
     Uses VDC extent dimensions by default, but prefers 1x1 binary tile-array
     wrapper dimensions (class-0/id-19 header) when present.
     """
-    size_hint, payloads = _collect_element29_raster_payloads(data)
+    if size_hint is None or payloads is None:
+        size_hint, payloads = _collect_element29_raster_payloads(data)
     if size_hint is None:
         return None
 
@@ -327,6 +390,11 @@ def _render_first_element29_raster(
     ) in payloads:
         decode_w = decode_w_hint if isinstance(decode_w_hint, int) and decode_w_hint > 0 else width
         decode_h = decode_h_hint if isinstance(decode_h_hint, int) and decode_h_hint > 0 else height
+        decode_w, decode_h = _cap_decode_dimensions(
+            decode_w,
+            decode_h,
+            max_pixels=_MAX_ELEMENT29_SINGLE_DECODE_PIXELS,
+        )
         image = _decode_element29_payload_with_fallbacks(
             payload,
             width=decode_w,
@@ -344,12 +412,20 @@ def _render_first_element29_raster(
 
 def _render_first_tile_array_overlays(
     data: bytes,
+    *,
+    tile_arrays: list[dict[str, object]] | None = None,
+    indexed_palette: bytes | None = None,
+    color_value_extent: tuple[int, int, int, int, int, int] | None = None,
 ) -> tuple[list[tuple[str, float, float, float, float]], int, int] | None:
     """Decode first available tile array and return per-tile SVG overlays."""
-    indexed_palette = indexed_palette_bytes(extract_color_table(data))
-    color_value_extent = extract_color_value_extent(data)
+    palette = indexed_palette
+    if palette is None:
+        palette = indexed_palette_bytes(extract_color_table(data))
+    if color_value_extent is None:
+        color_value_extent = extract_color_value_extent(data)
 
-    for array in _parse_tile_arrays(data):
+    arrays = tile_arrays if tile_arrays is not None else _parse_tile_arrays(data)
+    for array in arrays:
         cols = coerce_int(array.get("cols", 1))
         rows = coerce_int(array.get("rows", 1))
         tile_w_nominal = coerce_int(array.get("tile_width", 1))
@@ -393,7 +469,7 @@ def _render_first_tile_array_overlays(
                 orientation=tile_payload.get("orientation")
                 if isinstance(tile_payload.get("orientation"), int)
                 else None,
-                indexed_palette=indexed_palette,
+                indexed_palette=palette,
                 color_value_extent=color_value_extent,
             )
             if tile_img is None:
@@ -429,28 +505,49 @@ def _render_first_tile_array_overlays(
 
 def _render_raster_background_data_uri(
     data: bytes,
+    *,
+    tile_arrays: list[dict[str, object]] | None = None,
+    indexed_palette: bytes | None = None,
+    color_value_extent: tuple[int, int, int, int, int, int] | None = None,
+    raw_images: list[Any] | None = None,
+    element29_size_hint: tuple[int, int] | None = None,
+    element29_payloads: list[tuple[int, int, int, int, bytes, int | None, int | None]]
+    | None = None,
 ) -> tuple[str, int, int] | None:
     from cgm.extract.raster import extract_raw_images_from_bytes  # noqa: PLC0415
 
-    tiled = _render_first_tile_array(data)
+    tiled = _render_first_tile_array(
+        data,
+        tile_arrays=tile_arrays,
+        indexed_palette=indexed_palette,
+        color_value_extent=color_value_extent,
+    )
     if tiled is not None:
         href = _image_to_png_data_uri(tiled)
         if href is not None:
             return href, tiled.width, tiled.height
 
-    class29_raster = _render_first_element29_raster(data)
+    class29_raster = _render_first_element29_raster(
+        data,
+        size_hint=element29_size_hint,
+        payloads=element29_payloads,
+    )
     if class29_raster is not None:
         href = _image_to_png_data_uri(class29_raster)
         if href is not None:
             return href, class29_raster.width, class29_raster.height
 
-    indexed_palette = indexed_palette_bytes(extract_color_table(data))
-    color_value_extent = extract_color_value_extent(data)
+    palette = indexed_palette
+    if palette is None:
+        palette = indexed_palette_bytes(extract_color_table(data))
+    if color_value_extent is None:
+        color_value_extent = extract_color_value_extent(data)
 
-    for image in extract_raw_images_from_bytes(data):
+    images = raw_images if raw_images is not None else extract_raw_images_from_bytes(data)
+    for image in images:
         rendered = render_raw_image_payload(
             image,
-            indexed_palette=indexed_palette,
+            indexed_palette=palette,
             color_value_extent=color_value_extent,
         )
         if rendered is None:
@@ -464,14 +561,19 @@ def _render_raster_background_data_uri(
 
 def extract_vector_svg_from_bytes(
     data: bytes,
+    *,
+    elements: list[CGMElement] | None = None,
 ) -> str:
     """Convert CGM vector primitives and raster candidates into SVG.
 
     Raster precedence is: explicit tile-array overlays, id-29 multi-tile
     overlays, id-29 single-raster background, then Cell Array raster fallback.
     """
+    parsed_elements = list(iter_elements(data)) if elements is None else elements
     style = _SvgStyle()
-    color_table = extract_color_table(data)
+    color_table = extract_color_table(data, elements=parsed_elements)
+    color_value_extent = extract_color_value_extent(data, elements=parsed_elements)
+    indexed_palette = indexed_palette_bytes(color_table)
     text_items: list[tuple[float, float, str, str, float]] = []
     restricted_text_items: list[tuple[float, float, float, float, str, str, float]] = []
     polyline_items: list[tuple[list[tuple[float, float]], str, float]] = []
@@ -482,21 +584,50 @@ def extract_vector_svg_from_bytes(
     ellipse_items: list[tuple[float, float, float, float, str, float]] = []
     gdp_parameters: list[bytes] = []
     vdc_extent: tuple[float, float, float, float] | None = None
-    descriptor_profile = extract_descriptor_profile(data)
-    raster_tile_overlays = _render_first_tile_array_overlays(data)
-    element29_overlays = (
-        None if raster_tile_overlays is not None else _render_element29_overlays(data)
+    descriptor_profile = extract_descriptor_profile(data, elements=parsed_elements)
+    tile_arrays = _parse_tile_arrays(data, elements=parsed_elements)
+    element29_size_hint, element29_payloads = _collect_element29_raster_payloads(
+        data,
+        elements=parsed_elements,
     )
+    raster_tile_overlays = _render_first_tile_array_overlays(
+        data,
+        tile_arrays=tile_arrays,
+        indexed_palette=indexed_palette,
+        color_value_extent=color_value_extent,
+    )
+    element29_overlays = (
+        None
+        if raster_tile_overlays is not None
+        else _render_element29_overlays(
+            data,
+            size_hint=element29_size_hint,
+            payloads=element29_payloads,
+        )
+    )
+    raw_images = None
+    if raster_tile_overlays is None and element29_overlays is None:
+        from cgm.extract.raster import extract_raw_images_from_bytes  # noqa: PLC0415
+
+        raw_images = extract_raw_images_from_bytes(data, elements=parsed_elements)
     raster_background = (
         None
         if raster_tile_overlays is not None or element29_overlays is not None
-        else _render_raster_background_data_uri(data)
+        else _render_raster_background_data_uri(
+            data,
+            tile_arrays=tile_arrays,
+            indexed_palette=indexed_palette,
+            color_value_extent=color_value_extent,
+            raw_images=raw_images,
+            element29_size_hint=element29_size_hint,
+            element29_payloads=element29_payloads,
+        )
     )
     transparency_enabled = True
     clip_enabled = False
     clip_rectangle: tuple[float, float, float, float] | None = None
 
-    for element in iter_elements(data):
+    for element in parsed_elements:
         if element.class_id == 2 and element.element_id == 6:
             decoded_vdc = decode_vdc_extent(element.parameters)
             if decoded_vdc is not None:

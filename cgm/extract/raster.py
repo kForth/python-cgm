@@ -122,23 +122,25 @@ def extract_rendered_images_to_directory(
     *,
     stem: str = "image",
     debug_report: bool = False,
+    elements: list[CGMElement] | None = None,
+    raw_data: bytes | None = None,
 ) -> list[Path]:
     """Write a composed SVG with raster background and vector overlays."""
     path = Path(file_path)
-    raw = path.read_bytes()
+    raw = raw_data if raw_data is not None else path.read_bytes()
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     svg_path = out_dir / f"{stem}_0000.svg"
     svg_path.write_text(
-        extract_vector_svg_from_bytes(raw),
+        extract_vector_svg_from_bytes(raw, elements=elements),
         encoding="utf-8",
     )
     written.append(svg_path)
 
     if debug_report:
         arrays_report: list[dict[str, object]] = []
-        for idx, array in enumerate(_parse_tile_arrays(raw)):
+        for idx, array in enumerate(_parse_tile_arrays(raw, elements=elements)):
             tiles = array.get("tiles", [])
             arrays_report.append(
                 {
@@ -156,7 +158,7 @@ def extract_rendered_images_to_directory(
         report = {
             "source": str(path),
             "arrays": arrays_report,
-            "raw_image_count": len(extract_raw_images_from_bytes(raw)),
+            "raw_image_count": len(extract_raw_images_from_bytes(raw, elements=elements)),
         }
         report_path = out_dir / f"{stem}_decode_report.json"
         report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

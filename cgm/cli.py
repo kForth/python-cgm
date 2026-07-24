@@ -15,6 +15,7 @@ from cgm.extract import (
     extract_hotspots_to_directory,
     extract_rendered_images_to_directory,
 )
+from cgm.parser import iter_elements
 
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
@@ -39,6 +40,8 @@ def cli(
 
     written_paths: list[Path] = []
     stem = srcfile.stem or "image"
+    raw = srcfile.read_bytes()
+    elements = list(iter_elements(raw))
 
     try:
         written_paths.extend(
@@ -47,9 +50,17 @@ def cli(
                 output_dir,
                 stem=stem,
                 debug_report=debug,
+                raw_data=raw,
+                elements=elements,
             )
         )
-        hotspot_path = extract_hotspots_to_directory(srcfile, output_dir, stem=stem)
+        hotspot_path = extract_hotspots_to_directory(
+            srcfile,
+            output_dir,
+            stem=stem,
+            raw_data=raw,
+            elements=elements,
+        )
         written_paths.append(hotspot_path)
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from exc
