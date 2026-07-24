@@ -73,6 +73,43 @@ def _sample_corpus_sources(root: Path, sample_size: int = 200) -> list[Path]:
     return sorted(random.Random(0).sample(sources, sample_size))
 
 
+def test_fixture_source_prefers_sample_directory(tmp_path: Path) -> None:
+    root = tmp_path
+    sample_file = root / "sample" / "fixture.cgm"
+    test_file = root / "test_files" / "fixture.cgm"
+    sample_file.parent.mkdir(parents=True)
+    test_file.parent.mkdir(parents=True)
+    sample_file.write_bytes(b"sample")
+    test_file.write_bytes(b"test")
+
+    source = _fixture_source(root, "fixture.cgm")
+
+    assert source == sample_file
+    assert source.read_bytes() == b"sample"
+
+
+def test_fixture_source_skips_when_no_fixture_exists(tmp_path: Path) -> None:
+    with pytest.raises(pytest.skip.Exception):
+        _fixture_source(tmp_path, "missing.cgm")
+
+
+def test_sample_corpus_sources_limits_and_stabilizes_selection(tmp_path: Path) -> None:
+    root = tmp_path
+    corpus_dir = root / "test_files"
+    corpus_dir.mkdir()
+    for index in range(250):
+        (corpus_dir / f"file_{index:03d}.cgm").write_bytes(bytes([index % 256]))
+
+    first = _sample_corpus_sources(root)
+    second = _sample_corpus_sources(root)
+
+    assert len(first) == 200
+    assert len(second) == 200
+    assert first == second
+    assert first == sorted(first)
+    assert all(path.exists() for path in first)
+
+
 def test_extract_raw_images_from_bytes_reads_cell_array_payload() -> None:
     params = (
         (b"\x00" * 12)
