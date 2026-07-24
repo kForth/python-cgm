@@ -2,6 +2,7 @@
 
 [![GitHub](https://img.shields.io/badge/github-repo-blue?logo=github)](https://github.com/kForth/python-cgm)
 [![GitHub License](https://img.shields.io/github/license/kforth/python-cgm)](https://github.com/kForth/python-cgm/blob/main/LICENSE)
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/kForth/python-cgm/ci.yml)
 [![GitHub Forks](https://img.shields.io/github/forks/kforth/python-cgm)](https://github.com/kForth/python-cgm/forks)
 [![GitHub Stars](https://img.shields.io/github/stars/kforth/python-cgm)](https://github.com/kForth/python-cgm/stargazers)
 
